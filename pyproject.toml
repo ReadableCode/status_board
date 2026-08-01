@@ -1,0 +1,44 @@
+[project]
+name = "status-board"
+version = "0.1.0"
+description = "Terminal status board: remote jobs over SSH and PRs awaiting review, in one long-lived TUI"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0.2",
+    "requests>=2.32.3",
+    "rich>=13.0.0",
+    "textual>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "flake8>=7.0.0",
+    "isort>=5.0.0",
+    "mypy>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.flake8]
+max-line-length = 120
+max-complexity = 15
+extend-ignore = ["E203", "W503"]
+extend-exclude = [".venv"]
+
+[tool.isort]
+profile = "black"
+lines_between_types = 0
+lines_between_sections = 1
+known_third_party = ["config"]
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+no_lines_before = ["FIRSTPARTY"]
+
+[tool.mypy]
+ignore_missing_imports = true
+show_error_codes = true
+# src/utils is a plain directory on sys.path (no __init__.py), same as the
+# runtime import layout - anchor module names at the repo root so files
+# aren't mapped twice
+explicit_package_bases = true

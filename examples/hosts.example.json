@@ -1,0 +1,18 @@
+{
+  "_comment": "Host inventory. Real file: <context>_hosts.json at the root of a sibling *_credentials repo (legacy fallback name: hosts.json). Panels resolve their host/jump tokens against every sibling inventory, the panel's own repo first. 'user' and 'port' are optional; 'aliases' are extra names a panel may use.",
+  "hosts": [
+    {
+      "name": "LAPTOP-1",
+      "hostname": "203.0.113.10",
+      "user": "jdoe",
+      "port": 2222,
+      "aliases": ["sshacme"]
+    },
+    {
+      "name": "vm-01",
+      "hostname": "10.0.0.20",
+      "user": "svc_acme",
+      "aliases": ["sshacmevm"]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+# Example status board config.
+#
+# Where this file really lives (see README "Where panels come from"):
+#   - <context>_statusboard.yaml at the ROOT of a sibling *_credentials repo,
+#     e.g. ~/GitHub/acme_credentials/acme_statusboard.yaml  (private panels)
+#   - or statusboard.yaml at the root of THIS repo (tracked and public, so
+#     secrets-free panels only)
+#
+# The file is a YAML list of panels. Panel names must be unique across ALL
+# loaded configs. Run `python src/status_board.py --add` for a wizard that
+# writes these entries for you.
+
+# --- ssh_command: run a command on a remote machine and show its output ----
+- name: acme_vm_cron_jobs
+  type: ssh_command
+  host: sshacmevm            # inventory name or alias (see hosts.example.json)
+  jump: sshacme              # optional jump hop, resolved from the same inventories
+  command: "bash ~/scripts/job_status.sh"
+  host_stats: true           # optional: pin htop-style disk/cpu/mem meters below the output
+  log_link:                  # optional: click a row to live-follow its log
+    pattern: '^[●○] \S+ +(\S+)'          # first capture group = the job token
+    command: "tail -n 200 -F ~/logs/{job}.log"
+  interval: 300              # seconds between refreshes (default 300 for ssh_command)
+  timeout: 90                # optional ssh timeout, default 60
+
+# --- ssh_command, stats-only: just the disk/cpu/mem meters for a host ------
+- name: acme_vm_stats
+  type: ssh_command
+  host: sshacmevm
+  host_stats: true
+  interval: 300
+
+# --- github_prs: PRs awaiting your review, one panel per account/token -----
+- name: github_personal_prs
+  type: github_prs
+  token_env: GH_PAT_PERSONAL # env var holding a READ-ONLY PAT - never the token itself
+  env_file: example.env      # optional, relative to this config's repo root
+  browser: chrome            # optional: open clicked PRs in this browser
+  interval: 180
+
+# --- bitbucket_prs: open PRs listing you as reviewer (or authored by you) --
+- name: acme_bitbucket_prs
+  type: bitbucket_prs
+  workspace: some-workspace
+  repos: [repo-a, repo-b]    # omit to scan every repo in the workspace (slower)
+  username_env: BB_USERNAME
+  app_password_env: BB_APP_PASSWORD
+  env_file: example.env
+  browser: edge
+  interval: 180
