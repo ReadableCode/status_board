@@ -5,10 +5,16 @@ description = "Terminal status board: remote jobs over SSH and PRs awaiting revi
 requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6.0.2",
+    # Shared inventory/ssh/host-stats plumbing + terminal-navy design tokens.
+    # Resolved from git, pinned to a tag - see [tool.uv.sources] below.
+    "readable-utils>=0.3.0",
     "requests>=2.32.3",
     "rich>=13.0.0",
     "textual>=1.0.0",
 ]
+
+[tool.uv.sources]
+readable-utils = { git = "https://github.com/ReadableCode/readable_utils.git", tag = "v0.3.0" }
 
 [dependency-groups]
 dev = [
@@ -31,7 +37,7 @@ extend-exclude = [".venv"]
 profile = "black"
 lines_between_types = 0
 lines_between_sections = 1
-known_third_party = ["config"]
+known_third_party = ["config", "readable_utils"]
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 no_lines_before = ["FIRSTPARTY"]
 

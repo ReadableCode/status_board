@@ -1,7 +1,6 @@
 # %%
 # Imports #
 
-import json
 import os
 import re
 import subprocess
@@ -10,11 +9,25 @@ from datetime import datetime
 
 import requests
 import yaml
-from utils.inventory_tools import (
+from readable_utils.host_stats_tools import (  # noqa: F401 - STATS_MARKER re-exported for callers
+    HOST_STATS_COMMAND,
+    STATS_MARKER,
+    parse_host_stats,
+    split_host_stats,
+)
+from readable_utils.inventory_tools import (
     credentials_context,
     find_credentials_dirs,
+    find_host_record,
     find_inventory_paths,
     overlay_context,
+)
+from readable_utils.ssh_tools import (  # noqa: F401 - options/destination re-exported for callers
+    SSH_BASE_OPTIONS,
+)
+from readable_utils.ssh_tools import build_ssh_argv as build_host_ssh_argv
+from readable_utils.ssh_tools import (  # noqa: F401 - options/destination re-exported for callers
+    ssh_destination,
 )
 
 # %%
@@ -29,34 +42,12 @@ DEFAULT_HTTP_TIMEOUT = 30
 DEFAULT_GITHUB_API = "https://api.github.com"
 BITBUCKET_API = "https://api.bitbucket.org/2.0"
 
-# One machine-readable line of host stats appended to (or standing in for) an
-# ssh_command panel's remote command when ``host_stats`` is set. Reads only
-# numbers the kernel already maintains - df for the root filesystem,
-# /proc/loadavg (the same 1/5/15-minute CPU averages top's header shows, so a
-# 5-minute refresh reads the 5-minute column with nothing tracked on the
-# host), and free for current memory (Linux keeps no memory average, so that
-# one is a point-in-time reading). Linux hosts only. The board strips this
-# line off the output and renders it locally as meter bars, so every
-# host_stats panel looks identical regardless of what else it runs.
-STATS_MARKER = "@@STATS@@"
-HOST_STATS_COMMAND = (
-    f"printf '{STATS_MARKER} disk=%s load=%s cpu=%s mem=%s\\n' "
-    "\"$(df -Pk / | awk 'NR==2{print $3\"/\"$2}')\" "
-    "\"$(cut -d' ' -f1-3 /proc/loadavg | tr ' ' ',')\" "
-    "\"$(nproc)\" "
-    "\"$(free -m | awk 'NR==2{print $3\"/\"$2}')\""
-)
-
-# ssh options used for every panel connection: never prompt (this runs
-# unattended in a long-lived TUI), fail fast when a hop is unreachable, and
-# accept-new host keys so a fresh machine with the credentials repos cloned
-# works without hand-seeding known_hosts (changed keys still hard-fail).
-SSH_BASE_OPTIONS = (
-    "-T",
-    "-o", "BatchMode=yes",
-    "-o", "ConnectTimeout=10",
-    "-o", "StrictHostKeyChecking=accept-new",
-)
+# The @@STATS@@ probe, its parser, and the ssh plumbing (base options, jump
+# hops, identity files, the run-locally short-circuit) live in readable_utils
+# so herdstone and this board can't drift apart - this module only keeps the
+# panel-level wiring.
+_split_host_stats = split_host_stats
+_parse_host_stats = parse_host_stats
 
 
 # %%
@@ -217,13 +208,6 @@ def _validate_log_link(panel, config_path):
 # Host inventory #
 
 
-def load_inventory_hosts(inventory_path):
-    """Parse one hosts.json-style inventory and return its full host records."""
-    with open(inventory_path, "r", encoding="utf-8") as file_handle:
-        inventory = json.load(file_handle)
-    return inventory.get("hosts", [])
-
-
 def find_host(token, base_dir, credentials_root):
     """
     Resolve a panel's host token (inventory ``name`` or one of its
@@ -239,22 +223,7 @@ def find_host(token, base_dir, credentials_root):
             inventory_paths.append(path)
             break
     inventory_paths += [path for path in find_inventory_paths(credentials_root) if path not in inventory_paths]
-    wanted = token.strip().lower()
-    for path in inventory_paths:
-        for host in load_inventory_hosts(path):
-            names = [host.get("name", "")] + list(host.get("aliases", []))
-            if any(name.lower() == wanted for name in names if name):
-                return host
-    raise ValueError(
-        f"Host '{token}' not found in any host inventory "
-        f"({', '.join(inventory_paths) or 'no inventories found'})"
-    )
-
-
-def ssh_destination(host):
-    """user@hostname for a resolved inventory record (user optional in the record)."""
-    user = host.get("user")
-    return f"{user}@{host['hostname']}" if user else host["hostname"]
+    return find_host_record(token, inventory_paths)
 
 
 def panel_command(panel):
@@ -272,33 +241,21 @@ def panel_command(panel):
 
 def build_ssh_argv(panel, credentials_root, local_hostname="", command=None):
     """
-    Build the full ssh argv for an ssh_command panel, resolving ``host`` and
-    the optional ``jump`` hop from the host inventories. ``command`` overrides
+    Build the full argv for an ssh_command panel, resolving ``host`` and the
+    optional ``jump`` hop from the host inventories. ``command`` overrides
     the panel's own command (same host/hop chain) - used by the log-follow
     pane to stream a tail over the connection the panel already defines.
 
-    The jump hop is injected as ``-J user@host:port`` so the chain lives
-    entirely in the panel config + inventories - deliberately NOT in any
-    machine's ~/.ssh/config, so the board works identically on every machine
-    that has the credentials repos cloned. When the board is already running
-    ON the jump machine (local_hostname matches), the hop is skipped.
+    The chain semantics (jump-hop injection, skip-the-hop-when-this-machine-
+    IS-the-jump, identity_file/port support, and running the command locally
+    when the target IS this machine) live in readable_utils.ssh_tools, shared
+    with herdstone.
     """
     target = find_host(panel["host"], panel["_base_dir"], credentials_root)
-    argv = ["ssh", *SSH_BASE_OPTIONS]
-    jump_token = panel.get("jump")
-    if jump_token:
-        jump = find_host(jump_token, panel["_base_dir"], credentials_root)
-        local_short = (local_hostname or "").split(".")[0].lower()
-        jump_names = [jump.get("name", "")] + list(jump.get("aliases", []))
-        if local_short not in [name.split(".")[0].lower() for name in jump_names if name]:
-            spec = ssh_destination(jump)
-            if jump.get("port"):
-                spec += f":{jump['port']}"
-            argv += ["-J", spec]
-    if target.get("port"):
-        argv += ["-p", str(target["port"])]
-    argv += [ssh_destination(target), command or panel_command(panel)]
-    return argv
+    jump = find_host(panel["jump"], panel["_base_dir"], credentials_root) if panel.get("jump") else None
+    return build_host_ssh_argv(
+        target, command or panel_command(panel), jump=jump, local_hostname=local_hostname
+    )
 
 
 # %%
@@ -370,42 +327,6 @@ def fetch_ssh_command(panel, credentials_root, local_hostname=""):
     if panel.get("host_stats"):
         output, stats = _split_host_stats(output)
     return PanelResult(True, "ansi", output, f"exit {completed.returncode}", stats=stats)
-
-
-def _split_host_stats(output):
-    """
-    Split the trailing STATS_MARKER line off a command's output and parse it,
-    returning (body, stats_dict_or_None). When the last line isn't the marker
-    - the remote command somehow swallowed it - the output is returned
-    untouched with no stats.
-    """
-    body, _, last = output.rpartition("\n")
-    if not last.startswith(STATS_MARKER):
-        return output, None
-    return body.rstrip(), _parse_host_stats(last)
-
-
-def _parse_host_stats(line):
-    """
-    ``@@STATS@@ disk=used_kb/total_kb load=1m,5m,15m cpu=n mem=used_mb/total_mb``
-    -> structured dict, or None when any field is missing/garbled (a partial
-    stats line renders as "unavailable" rather than taking the panel down).
-    """
-    try:
-        fields = dict(item.split("=", 1) for item in line.split()[1:])
-        disk_used, disk_total = (int(value) for value in fields["disk"].split("/"))
-        mem_used, mem_total = (int(value) for value in fields["mem"].split("/"))
-        load_1m, load_5m, load_15m = (float(value) for value in fields["load"].split(","))
-        return {
-            "disk_used_kb": disk_used,
-            "disk_total_kb": disk_total,
-            "load": (load_1m, load_5m, load_15m),
-            "cpus": int(fields["cpu"]),
-            "mem_used_mb": mem_used,
-            "mem_total_mb": mem_total,
-        }
-    except (KeyError, ValueError):
-        return None
 
 
 def fetch_github_prs(panel):

@@ -14,6 +14,10 @@ uv run python src/status_board.py --once    # one static render, no TUI (sanity 
 uv run python src/status_board.py --add     # wizard: add a new panel to a config
 ```
 
+The TUI uses the readablecode "terminal navy" theme (shared with herdstone
+via `readable-utils`); `--once` fetches every panel concurrently and prints
+in config order.
+
 ## Keys
 
 | Key | Action |
@@ -116,7 +120,11 @@ command line as `ssh -J user@host:port`, so the chain lives entirely in
 config + inventory — **deliberately not in any machine's `~/.ssh/config`** —
 and the board behaves identically on any machine with the credentials repos
 cloned. When the board runs on the jump machine itself, the hop is skipped
-automatically.
+automatically; when the *target* is the machine the board runs on, the
+command runs locally with no ssh at all. An inventory host's
+`identity_file` is passed as `-i`. This chain logic lives in the shared
+`readable-utils` package (git-pinned in `[tool.uv.sources]`), the same code
+the herdstone repo uses, so the two can't drift.
 
 Requirements: non-interactive key auth to every hop (connections use
 `BatchMode=yes`, so a password prompt = instant failure), and

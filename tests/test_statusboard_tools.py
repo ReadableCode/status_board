@@ -275,6 +275,23 @@ def test_build_ssh_argv_target_port(tmp_path):
     assert "-J" not in argv
 
 
+def test_build_ssh_argv_identity_file(tmp_path):
+    hosts = [{"name": "boxy", "hostname": "10.0.0.5", "user": "me", "identity_file": "~/.ssh/id_boxy"}]
+    repo = make_credentials_repo(tmp_path, "acme", hosts=hosts)
+    panel = {"name": "p", "type": "ssh_command", "host": "boxy", "command": "uptime", "_base_dir": repo}
+    argv = statusboard_tools.build_ssh_argv(panel, str(tmp_path), local_hostname="OTHERBOX")
+    assert argv[argv.index("-i") + 1] == os.path.expanduser("~/.ssh/id_boxy")
+
+
+def test_build_ssh_argv_runs_locally_when_target_is_this_machine(tmp_path):
+    # inventory-name match against local_hostname -> plain shell argv, no ssh
+    repo = make_credentials_repo(tmp_path, "acme", hosts=ACME_HOSTS)
+    panel = {"name": "p", "type": "ssh_command", "host": "sshvm", "command": "uptime", "_base_dir": repo}
+    argv = statusboard_tools.build_ssh_argv(panel, str(tmp_path), local_hostname="vm-01.internal")
+    assert argv[0] != "ssh"
+    assert argv[-1] == "uptime"
+
+
 # %%
 # Secrets #
 

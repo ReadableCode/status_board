@@ -5,7 +5,7 @@ import os
 import re
 
 import yaml
-from utils.inventory_tools import credentials_context, find_credentials_dirs
+from readable_utils.inventory_tools import credentials_context, find_credentials_dirs
 from utils.statusboard_tools import (
     DEFAULT_INTERVALS,
     DEFAULT_SSH_TIMEOUT,

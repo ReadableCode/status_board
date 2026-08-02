@@ -2,7 +2,6 @@
 # Imports #
 
 import argparse
-import colorsys
 import platform
 import re
 import shlex
@@ -10,13 +9,21 @@ import subprocess
 import sys
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from itertools import groupby
 
 from config import grandparent_dir, parent_dir
+from readable_utils.host_stats_tools import (  # noqa: F401 - meter pieces re-exported for callers/tests
+    METER_EMPTY,
+    METER_FILLED,
+    METER_WIDTH,
+    ramp_style,
+    stats_renderable,
+)
+from readable_utils.host_tools import get_uppercase_hostname
 from rich.console import Console
 from rich.style import Style
 from rich.text import Text
-from utils.host_tools import get_uppercase_hostname
 from utils.statusboard_tools import build_ssh_argv, fetch_panel, load_panels
 
 # %%
@@ -66,78 +73,9 @@ def open_link(url, browser=None):
 
 
 # %%
-# Host-stats meters #
-
-METER_WIDTH = 22
-METER_FILLED, METER_EMPTY = "█", "░"
-
-
-def ramp_style(fraction):
-    """
-    Hex color for a 0..1 fullness fraction: a smooth green -> yellow -> red
-    HSV ramp (hue 120° down to 0°), the same scale htop paints its meters
-    with - calm at empty, alarming at full.
-    """
-    fraction = min(max(fraction, 0.0), 1.0)
-    hue = (1.0 - fraction) * 120.0 / 360.0
-    red, green, blue = colorsys.hsv_to_rgb(hue, 0.75, 0.95)
-    return f"#{int(red * 255):02x}{int(green * 255):02x}{int(blue * 255):02x}"
-
-
-def append_meter(text, label, fraction, value):
-    """
-    Append one htop-style meter to text: dim label, bracketed gradient bar
-    (each filled cell colored by its own position on the ramp, so the bar
-    visibly "heats up" as it fills), and the value readout colored by the
-    overall fullness.
-    """
-    fraction = min(max(fraction, 0.0), 1.0)
-    text.append(f"{label} ", style="bold")
-    text.append("▕", style="grey35")
-    filled = round(fraction * METER_WIDTH)
-    for cell in range(METER_WIDTH):
-        if cell < filled:
-            text.append(METER_FILLED, style=ramp_style((cell + 0.5) / METER_WIDTH))
-        else:
-            text.append(METER_EMPTY, style="grey30")
-    text.append("▏", style="grey35")
-    text.append(f" {value}", style=ramp_style(fraction))
-
-
-def stats_renderable(stats):
-    """
-    One line of htop-style meters for a parsed host-stats dict: disk on /,
-    CPU (5-minute load average over core count - the kernel's own average for
-    a 5-minute refresh), and current memory. Rendered identically wherever
-    host stats appear: pinned under a command panel, as a stats-only panel's
-    body, and in --once output.
-    """
-    if not stats:
-        return Text("host stats unavailable", style="dim italic")
-    text = Text()
-    disk_fraction = stats["disk_used_kb"] / (stats["disk_total_kb"] or 1)
-    append_meter(
-        text, "disk /", disk_fraction,
-        f"{disk_fraction:>4.0%} {stats['disk_used_kb'] / 1048576:.0f}G of {stats['disk_total_kb'] / 1048576:.0f}G",
-    )
-    text.append("    ")
-    load_1m, load_5m, load_15m = stats["load"]
-    cpus = stats["cpus"] or 1
-    append_meter(
-        text, "cpu", load_5m / cpus,
-        f"{load_5m / cpus:>4.0%} load {load_1m:.2f} {load_5m:.2f} {load_15m:.2f} · {cpus} cores",
-    )
-    text.append("    ")
-    mem_fraction = stats["mem_used_mb"] / (stats["mem_total_mb"] or 1)
-    append_meter(
-        text, "mem", mem_fraction,
-        f"{mem_fraction:>4.0%} {stats['mem_used_mb'] / 1024:.1f}G of {stats['mem_total_mb'] / 1024:.1f}G",
-    )
-    return text
-
-
-# %%
 # Rendering #
+# (the host-stats meters - ramp_style, stats_renderable, METER_* - live in
+# readable_utils.host_stats_tools, shared with herdstone)
 
 
 def legend_text():
@@ -407,6 +345,7 @@ def build_app(panels, local_hostname):
     Construct the Textual app class lazily so --once (and the unit tests)
     never need textual imported at module import time.
     """
+    from readable_utils.design_tokens import terminal_navy_textual_theme
     from textual.app import App, ComposeResult
     from textual.containers import Vertical, VerticalScroll
     from textual.widgets import Footer, Header, Static
@@ -417,6 +356,13 @@ def build_app(panels, local_hostname):
 
     class StatusBoardApp(App):
         TITLE = "status board"
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # the shared readablecode "terminal navy" palette (same theme
+            # herdstone's TUI registers), so the two boards read as one family
+            self.register_theme(terminal_navy_textual_theme())
+            self.theme = "terminal-navy"
         BINDINGS = [
             ("q", "quit", "quit"),
             ("r", "refresh_all", "refresh all"),
@@ -503,14 +449,19 @@ def build_app(panels, local_hostname):
 
 
 def run_once(panels, local_hostname):
-    """Fetch every panel sequentially and print a static board (sanity check / headless use)."""
+    """
+    Fetch every panel concurrently and print a static board in config order
+    (sanity check / headless use) - the herdstone fan-out idea, so the render
+    takes as long as the slowest panel instead of the sum of them.
+    """
     console = Console()
+    with ThreadPoolExecutor(max_workers=min(8, len(panels))) as pool:
+        results = list(pool.map(lambda p: fetch_panel(p, CREDENTIALS_ROOT, local_hostname), panels))
     last_context = None
-    for panel in panels:
+    for panel, result in zip(panels, results):
         if panel["_context"] != last_context:
             last_context = panel["_context"]
             console.rule(f"[bold]══ {last_context.replace('_', ' ')} ══[/bold]", style="cyan", characters="═")
-        result = fetch_panel(panel, CREDENTIALS_ROOT, local_hostname)
         state = result.summary or ("ok" if result.ok else "error")
         console.rule(f"[bold]{panel['name']}[/bold] · {state}", style="green" if result.ok else "red")
         if result.body or not (result.ok and panel.get("host_stats")):
