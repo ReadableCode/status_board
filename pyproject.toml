@@ -7,14 +7,14 @@ dependencies = [
     "pyyaml>=6.0.2",
     # Shared inventory/ssh/host-stats plumbing + terminal-navy design tokens.
     # Resolved from git, pinned to a tag - see [tool.uv.sources] below.
-    "readable-utils>=0.3.0",
+    "readable-utils>=0.3.2",
     "requests>=2.32.3",
     "rich>=13.0.0",
     "textual>=1.0.0",
 ]
 
 [tool.uv.sources]
-readable-utils = { git = "https://github.com/ReadableCode/readable_utils.git", tag = "v0.3.0" }
+readable-utils = { git = "https://github.com/ReadableCode/readable_utils.git", tag = "v0.3.2" }
 
 [dependency-groups]
 dev = [

@@ -952,8 +952,8 @@ wheels = [
 
 [[package]]
 name = "readable-utils"
-version = "0.3.0"
-source = { git = "https://github.com/ReadableCode/readable_utils.git?tag=v0.3.0#6760eff8912fa6a4da1b06b71ea90fcf4e233c01" }
+version = "0.3.2"
+source = { git = "https://github.com/ReadableCode/readable_utils.git?tag=v0.3.2#5123c85b9d6045c34087a88fbb07042b21becd64" }
 dependencies = [
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1022,7 +1022,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "readable-utils", git = "https://github.com/ReadableCode/readable_utils.git?tag=v0.3.0" },
+    { name = "readable-utils", git = "https://github.com/ReadableCode/readable_utils.git?tag=v0.3.2" },
     { name = "requests", specifier = ">=2.32.3" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "textual", specifier = ">=1.0.0" },
