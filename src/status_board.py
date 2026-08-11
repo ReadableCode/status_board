@@ -226,7 +226,8 @@ def build_log_tail_screen():
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
-                    text=True,
+                    encoding="utf-8",  # remote logs are utf-8; Windows text mode would decode as cp1252
+                    errors="replace",
                 )
                 for line in self.process.stdout:
                     write(Text.from_ansi(line.rstrip("\n")))

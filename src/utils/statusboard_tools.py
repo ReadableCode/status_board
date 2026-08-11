@@ -313,7 +313,16 @@ def fetch_ssh_command(panel, credentials_root, local_hostname=""):
     timeout = panel.get("timeout", DEFAULT_SSH_TIMEOUT)
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL
+            # Explicit utf-8, not text=True: the remote output is utf-8 (the
+            # board glyphs), and on Windows text mode decodes with the ANSI
+            # codepage - the decode error kills subprocess's reader thread and
+            # stdout comes back None even on a successful run.
+            argv,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         return PanelResult.error(f"ssh timed out after {timeout}s: {' '.join(argv[:-1])}")
