@@ -561,6 +561,86 @@ def test_pr_review_states_tracks_commit_ids(monkeypatch):
     assert commits == {"me": "aaa111", "bob": "bbb222"}
 
 
+class FakeGithubResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self.payload = payload
+        self.headers = {}
+
+    def json(self):
+        return self.payload
+
+
+def test_github_login_falls_back_to_graphql_viewer_on_user_5xx(monkeypatch):
+    """/user 503 with search healthy: take the login from GraphQL, keep the panel alive."""
+    posted = []
+
+    def fake_post(url, **kwargs):
+        posted.append((url, kwargs.get("json")))
+        return FakeGithubResponse(200, {"data": {"viewer": {"login": "me"}}})
+
+    monkeypatch.setattr(statusboard_tools.requests, "get", lambda *a, **k: FakeGithubResponse(503))
+    monkeypatch.setattr(statusboard_tools.requests, "post", fake_post)
+    login, error = statusboard_tools._github_login("https://api.github.com", {})
+    assert (login, error) == ("me", None)
+    assert posted == [("https://api.github.com/graphql", {"query": "{viewer{login}}"})]
+    # Enterprise splits the APIs: /api/v3 for REST, /api/graphql for GraphQL
+    statusboard_tools._github_login("https://ghe.example.com/api/v3", {})
+    assert posted[-1][0] == "https://ghe.example.com/api/graphql"
+
+
+def test_github_login_error_blames_the_token_only_on_401_403(monkeypatch):
+    """A 5xx is GitHub's, not the PAT's - and a dead token skips the GraphQL hop."""
+    posts = []
+
+    def responses(user_code, viewer=FakeGithubResponse(503)):
+        monkeypatch.setattr(statusboard_tools.requests, "get", lambda *a, **k: FakeGithubResponse(user_code))
+        monkeypatch.setattr(statusboard_tools.requests, "post", lambda *a, **k: posts.append(a) or viewer)
+        login, error = statusboard_tools._github_login("https://api.github.com", {})
+        assert login is None
+        return error
+
+    assert responses(503) == "GitHub /user returned 503 (GitHub-side, not your token)" \
+        "; GraphQL viewer returned 503"
+    assert responses(404) == "GitHub /user returned 404; GraphQL viewer returned 503"
+    # GraphQL answering 200 with no viewer (schema/permission oddity) is still a failure
+    assert responses(503, FakeGithubResponse(200, {"data": {"viewer": None}})) == (
+        "GitHub /user returned 503 (GitHub-side, not your token); GraphQL viewer returned 200"
+    )
+    before = len(posts)
+    assert responses(401) == "GitHub /user returned 401 (bad/expired token?)"
+    assert responses(403) == "GitHub /user returned 403 (bad/expired token?)"
+    assert len(posts) == before  # no GraphQL attempt for a token GitHub already rejected
+
+
+def test_fetch_github_prs_renders_through_a_user_outage(monkeypatch):
+    """End to end: /user 503, GraphQL login, searches healthy -> real rows, no error panel."""
+    mine = gh_item("acme/app", 21, author="me")
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/user"):
+            return FakeGithubResponse(503)
+        if url.endswith("/search/issues"):
+            author_query = "author:me" in kwargs["params"]["q"]
+            return FakeGithubResponse(200, {"items": [mine] if author_query else []})
+        if url.endswith("/reviews"):
+            return FakeGithubResponse(200, [{"user": {"login": "bob"}, "state": "APPROVED", "commit_id": "a1"}])
+        if url.endswith("/user/orgs"):
+            return FakeGithubResponse(200, [])
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(statusboard_tools.requests, "get", fake_get)
+    monkeypatch.setattr(
+        statusboard_tools.requests, "post",
+        lambda *a, **k: FakeGithubResponse(200, {"data": {"viewer": {"login": "me"}}}),
+    )
+    monkeypatch.setattr(statusboard_tools, "resolve_secret", lambda panel, key: "x")
+    result = statusboard_tools.fetch_github_prs({"name": "gh", "type": "github_prs", "token_env": "T"})
+    assert result.ok
+    assert [row["url"] for row in result.body] == [mine["html_url"]]
+    assert result.summary.endswith("(me)")
+
+
 # %%
 # Bitbucket PR classification #
 

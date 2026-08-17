@@ -353,10 +353,9 @@ def fetch_github_prs(panel):
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    user_response = requests.get(f"{api}/user", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
-    if user_response.status_code != 200:
-        return PanelResult.error(f"GitHub /user returned {user_response.status_code} (bad/expired token?)")
-    login = user_response.json()["login"]
+    login, login_error = _github_login(api, headers)
+    if login_error:
+        return PanelResult.error(login_error)
 
     # A fine-grained token only surfaces repos it was granted, so a panel's
     # scope is primarily the TOKEN's repo selection; the optional ``search``
@@ -426,6 +425,40 @@ def fetch_github_prs(panel):
             f"{len(rows)} PRs visible without them ({login})"
         )
     return PanelResult(True, "links", rows, f"{summary} ({login})")
+
+
+def _github_login(api, headers):
+    """
+    The account behind the token, asking the token itself - no login in any
+    panel config. REST /user stays the primary probe (its status code is the
+    only thing that tells a dead token apart from a dead endpoint), with
+    GraphQL's ``viewer`` as fallback: a separate backend that kept serving the
+    login through a /user 503 while search and the PR endpoints - everything
+    else this panel needs - stayed healthy. Returns (login, error), error None
+    on success.
+    """
+    user_response = requests.get(f"{api}/user", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    if user_response.status_code == 200:
+        return user_response.json()["login"], None
+    code = user_response.status_code
+    # A revoked or expired token fails every endpoint alike, so don't bother
+    # GraphQL - and keep saying "token" only for the codes that mean it.
+    if code in (401, 403):
+        return None, f"GitHub /user returned {code} (bad/expired token?)"
+    # GitHub Enterprise splits the two APIs as /api/v3 and /api/graphql;
+    # github.com hangs GraphQL off the same api.github.com host.
+    graphql_url = f"{api[: -len('/api/v3')]}/api/graphql" if api.endswith("/api/v3") else f"{api}/graphql"
+    viewer_response = requests.post(
+        graphql_url, json={"query": "{viewer{login}}"}, headers=headers, timeout=DEFAULT_HTTP_TIMEOUT
+    )
+    if viewer_response.status_code == 200:
+        viewer = ((viewer_response.json().get("data") or {}).get("viewer") or {}).get("login")
+        if viewer:
+            return viewer, None
+    hint = " (GitHub-side, not your token)" if code >= 500 else ""
+    return None, (
+        f"GitHub /user returned {code}{hint}; GraphQL viewer returned {viewer_response.status_code}"
+    )
 
 
 def _pr_review_states(api, headers, item):
