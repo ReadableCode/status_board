@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import subprocess
 
 import pytest
 import yaml
@@ -759,6 +760,241 @@ def test_fetch_bitbucket_prs_filters_client_side_no_uuid_query(monkeypatch):
     assert "reviewers" in list_params["fields"] and "participants" in list_params["fields"]
     assert [row["badge"] for row in result.body] == ["●", "⬆"]  # PR 11 excluded
     assert result.summary == "1 to review · 0 on author · 1 yours (ws)"
+
+
+# %%
+
+# %%
+# http_checks #
+
+
+SITES = [
+    {"name": "intranet", "url": "https://intranet.acme.internal/", "insecure": True},
+    {"url": "http://10.0.0.20:8000/api/health"},
+    {"name": "sso portal", "url": "https://portal.acme.internal/", "expect": [200, 302, 401]},
+]
+SITES_PANEL = {"name": "acme_sites", "type": "http_checks", "sites": SITES}
+
+
+@pytest.mark.parametrize(
+    "panel, match",
+    [
+        ({"name": "x", "type": "http_checks"}, "missing required keys: sites"),
+        ({"name": "x", "type": "http_checks", "sites": "nope"}, "non-empty list"),
+        ({"name": "x", "type": "http_checks", "sites": []}, "missing required keys: sites"),
+        ({"name": "x", "type": "http_checks", "sites": [{"name": "no url"}]}, "every site needs a url"),
+        ({"name": "x", "type": "http_checks", "sites": [{"url": "ftp://x"}]}, "must start with http"),
+        ({"name": "x", "type": "http_checks", "sites": [{"url": "http://x", "expect": "200"}]}, "status code"),
+        ({"name": "x", "type": "http_checks", "sites": [{"url": "http://x", "expect": [200, True]}]}, "status code"),
+        ({"name": "x", "type": "http_checks", "sites": [{"url": "http://x"}], "jump": "j"}, "jump needs a host"),
+        ({"name": "x", "type": "http_checks", "sites": [{"url": "http://x"}], "host_stats": True}, "only supported"),
+    ],
+)
+def test_http_checks_validation(tmp_path, panel, match):
+    make_credentials_repo(tmp_path, "acme", panels=[panel])
+    with pytest.raises(ValueError, match=match):
+        statusboard_tools.load_panels(str(tmp_path))
+
+
+def test_http_checks_loads_with_defaults(tmp_path):
+    make_credentials_repo(tmp_path, "acme", panels=[SITES_PANEL])
+    panels, _ = statusboard_tools.load_panels(str(tmp_path))
+    assert panels[0]["interval"] == statusboard_tools.DEFAULT_INTERVALS["http_checks"]
+    assert panels[0]["sites"][2]["expect"] == [200, 302, 401]
+
+
+def test_curl_argv_flags_and_marker():
+    argv = statusboard_tools.curl_argv(SITES[0], 10, devnull="/dev/null")
+    assert argv[:6] == ["curl", "-sS", "-o", "/dev/null", "--max-time", "10"]
+    assert "-k" in argv and "-L" not in argv
+    assert argv[-1] == SITES[0]["url"]
+    fmt = argv[argv.index("-w") + 1]
+    assert fmt.startswith(statusboard_tools.HTTP_CHECK_MARKER)  # a leading "@" would make curl read a file
+    assert not fmt.startswith("@")
+    assert fmt.endswith("%{http_code} %{time_total}\\n")
+    assert "-k" not in statusboard_tools.curl_argv(SITES[1], 10)
+    assert statusboard_tools.curl_argv(SITES[1], 10)[3] == os.devnull
+
+
+def test_http_checks_command_one_block_per_site():
+    command = statusboard_tools.http_checks_command(dict(SITES_PANEL, max_time=7))
+    blocks = command.split("; echo ")
+    assert command.startswith(f"echo '{statusboard_tools.SITE_MARKER} 0'; curl ")
+    assert len(blocks) == len(SITES)
+    assert command.count("2>&1") == len(SITES)
+    assert "--max-time 7" in command
+    assert "-o /dev/null" in command
+    # the -w format is single-quoted so the shell leaves %{} and \n alone
+    assert f"-w '{statusboard_tools.HTTP_CHECK_MARKER} %{{http_code}} %{{time_total}}\\n'" in command
+
+
+REMOTE_OUTPUT = (
+    "==SITE== 0\n"
+    "==CHECK== 200 0.014022\n"
+    "==SITE== 1\n"
+    "curl: (7) Failed to connect to 10.0.0.20 port 8000 after 3 ms: Couldn't connect to server\n"
+    "==CHECK== 000 0.003100\n"
+    "==SITE== 2\n"
+    "==CHECK== 302 0.247034\n"
+)
+
+
+def test_split_site_blocks_and_parse():
+    blocks = statusboard_tools.split_site_blocks(REMOTE_OUTPUT)
+    assert sorted(blocks) == [0, 1, 2]
+    assert statusboard_tools.parse_http_check(blocks[0]) == {"code": 200, "seconds": 0.014022, "error": None}
+    down = statusboard_tools.parse_http_check(blocks[1])
+    assert down["code"] == 0
+    assert down["error"].startswith("(7) Failed to connect")
+    assert statusboard_tools.parse_http_check("") == {"code": 0, "seconds": None, "error": "no response from curl"}
+    # curl's multi-line cert advice: the reason line wins, the trailer still parses
+    cert_block = (
+        "curl: (60) SSL certificate problem: unable to get local issuer certificate\n"
+        "More details here: https://curl.se/docs/sslcerts.html\n\n"
+        "curl failed to verify the legitimacy of the server and therefore could not\n"
+        "==CHECK== 000 0.033715\n"
+    )
+    parsed = statusboard_tools.parse_http_check(cert_block)
+    assert parsed["code"] == 0 and parsed["error"].startswith("(60) SSL certificate problem")
+
+
+def test_site_is_up_default_and_expect():
+    up = statusboard_tools.site_is_up
+    assert up({}, {"code": 200}) and up({}, {"code": 302})
+    assert not up({}, {"code": 401}) and not up({}, {"code": 502}) and not up({}, {"code": 0})
+    assert up({"expect": 401}, {"code": 401}) and not up({"expect": 401}, {"code": 200})
+    assert up({"expect": [200, 401]}, {"code": 401})
+    assert not up({"expect": [200]}, {"code": 0})
+
+
+def test_site_label_defaults_to_host():
+    assert statusboard_tools.site_label(SITES[0]) == "intranet"
+    assert statusboard_tools.site_label(SITES[1]) == "10.0.0.20:8000"
+
+
+def test_http_check_rows_alignment_and_summary():
+    checks = [
+        {"code": 200, "seconds": 0.014, "error": None},
+        {"code": 0, "seconds": 0.003, "error": "(7) Failed to connect"},
+        {"code": 401, "seconds": 0.2, "error": None},
+    ]
+    rows, summary, down = statusboard_tools.http_check_rows(SITES, checks)
+    assert summary == "2 up · 1 DOWN" and down == 1
+    assert [row["badge"] for row in rows] == ["✓", "✗", "✓"]
+    assert rows[0]["text"] == "intranet" and rows[0]["url"] == SITES[0]["url"]
+    assert rows[0]["tail"].endswith("200 · 14ms")
+    assert rows[1]["tail"].endswith("DOWN · (7) Failed to connect") and rows[1]["tail_style"] == "red"
+    # status column aligned: label + tail padding is constant across rows
+    widths = {len(row["text"]) + len(row["tail"]) - len(row["tail"].lstrip()) for row in rows}
+    assert len(widths) == 1
+    rows, summary, down = statusboard_tools.http_check_rows(SITES[:1], checks[:1])
+    assert summary == "all 1 up" and down == 0
+    # a wrong status code is down with the code shown
+    rows, _, _ = statusboard_tools.http_check_rows(SITES[1:2], [{"code": 502, "seconds": 0.1, "error": None}])
+    assert rows[0]["tail"].endswith("DOWN · 502 · unexpected status 502")
+
+
+def test_fetch_http_checks_remote_runs_one_ssh_and_flags_alert(tmp_path, monkeypatch):
+    repo = make_credentials_repo(tmp_path, "acme", hosts=ACME_HOSTS)
+    panel = dict(SITES_PANEL, host="sshvm", jump="LAPTOP-1", _base_dir=repo)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return make_fake_run(REMOTE_OUTPUT, returncode=7)()  # last curl's exit status leaks through ssh
+
+    monkeypatch.setattr(statusboard_tools.subprocess, "run", fake_run)
+    result = statusboard_tools.fetch_http_checks(panel, str(tmp_path), local_hostname="OTHERBOX")
+    assert len(calls) == 1 and calls[0][0] == "ssh"
+    assert calls[0][calls[0].index("-J") + 1] == "jdoe@10.0.0.10:2222"
+    assert calls[0][-1] == statusboard_tools.http_checks_command(panel)
+    assert result.ok and result.alert
+    assert result.kind == "links"
+    assert result.summary == "2 up · 1 DOWN · from sshvm"
+    assert [row["badge"] for row in result.body] == ["✓", "✗", "✓"]
+
+
+def test_fetch_http_checks_remote_chain_failure_is_an_error(tmp_path, monkeypatch):
+    repo = make_credentials_repo(tmp_path, "acme", hosts=ACME_HOSTS)
+    panel = dict(SITES_PANEL, host="sshvm", _base_dir=repo)
+
+    def fake_run(argv, **kwargs):
+        completed = make_fake_run("", returncode=255)()
+        completed.stderr = "ssh: connect to host 10.0.0.20 port 22: No route to host"
+        return completed
+
+    monkeypatch.setattr(statusboard_tools.subprocess, "run", fake_run)
+    result = statusboard_tools.fetch_http_checks(panel, str(tmp_path), local_hostname="OTHERBOX")
+    assert not result.ok and "No route to host" in result.body
+
+
+def test_fetch_http_checks_local_runs_curl_per_site(tmp_path, monkeypatch):
+    panel = dict(SITES_PANEL, _base_dir=str(tmp_path))
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        completed = make_fake_run("==CHECK== 200 0.020000\n")()
+        completed.stderr = ""
+        return completed
+
+    monkeypatch.setattr(statusboard_tools.subprocess, "run", fake_run)
+    result = statusboard_tools.fetch_http_checks(panel, str(tmp_path))
+    assert len(calls) == len(SITES) and all(argv[0] == "curl" for argv in calls)
+    assert result.ok and not result.alert
+    assert result.summary == "all 3 up"
+
+
+def test_fetch_http_checks_host_is_this_machine_probes_locally(tmp_path, monkeypatch):
+    # host resolves to the board's own machine -> no ssh, no shell: per-site curl argv
+    repo = make_credentials_repo(tmp_path, "acme", hosts=ACME_HOSTS)
+    panel = dict(SITES_PANEL, host="sshvm", jump="LAPTOP-1", _base_dir=repo)
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        completed = make_fake_run("==CHECK== 302 0.100000\n")()
+        completed.stderr = ""
+        return completed
+
+    monkeypatch.setattr(statusboard_tools.subprocess, "run", fake_run)
+    result = statusboard_tools.fetch_http_checks(panel, str(tmp_path), local_hostname="vm-01.internal")
+    assert len(calls) == len(SITES) and all(argv[0] == "curl" for argv in calls)
+    assert result.summary == "all 3 up · from sshvm"
+
+
+def test_fetch_http_checks_local_timeout_is_down_not_error(tmp_path, monkeypatch):
+    panel = dict(SITES_PANEL, sites=SITES[:1], max_time=3, _base_dir=str(tmp_path))
+
+    def fake_run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(statusboard_tools.subprocess, "run", fake_run)
+    result = statusboard_tools.fetch_http_checks(panel, str(tmp_path))
+    assert result.ok and result.alert
+    assert result.body[0]["tail"].endswith("DOWN · (28) no answer within 3s")
+
+
+def test_fetch_http_checks_missing_curl_is_an_error(tmp_path, monkeypatch):
+    panel = dict(SITES_PANEL, _base_dir=str(tmp_path))
+
+    def fake_run(argv, **kwargs):
+        raise FileNotFoundError("curl")
+
+    monkeypatch.setattr(statusboard_tools.subprocess, "run", fake_run)
+    result = statusboard_tools.fetch_panel(panel, str(tmp_path))
+    assert not result.ok and "curl not found" in result.body
+
+
+def test_result_renderable_tail_on_same_line():
+    from src.status_board import result_renderable
+
+    rows = [{"badge": "✓", "badge_style": "bold green", "text": "intranet", "url": "https://x/",
+             "tail": "200 · 14ms", "tail_style": "dim"}]
+    plain = result_renderable(statusboard_tools.PanelResult(True, "links", rows, "all 1 up")).plain
+    assert plain == "✓ intranet  200 · 14ms"
+    plain = result_renderable(statusboard_tools.PanelResult(True, "links", rows), tui=True).plain
+    assert plain == "✓ intranet  200 · 14ms"
 
 
 # %%

@@ -2,8 +2,9 @@
 
 A long-lived [Textual](https://textual.textualize.io/) TUI that shows, in one
 pane: remote job/cron boards fetched over SSH (through jump hosts where
-needed) and PRs awaiting your review across multiple GitHub accounts (and
-Bitbucket). Panel definitions travel with the repos that own them — no
+needed), whether each of your sites is up (probed from wherever they are
+reachable), and PRs awaiting your review across multiple GitHub accounts
+(and Bitbucket). Panel definitions travel with the repos that own them — no
 central registry to edit.
 
 ```bash
@@ -28,7 +29,7 @@ in config order.
 | `tab` / `shift+tab` | move focus between panels (clicking a panel also focuses it) |
 | `esc` / `q` (in a log-follow pane) | back to the board |
 
-PR titles are clickable. Inside the TUI the click is handled by the app
+PR titles and site names are clickable. Inside the TUI the click is handled by the app
 itself (Textual owns the mouse, so terminal-native hyperlinks don't fire) and
 opens the panel's `browser:` if set — e.g. `browser: edge` sends a work
 account's PRs to Edge while everything else uses the OS default. Recognized
@@ -188,6 +189,54 @@ live — `tail -F` keeps following across log rotation. Press `esc` or `q`
 to return to the board (the remote tail is killed on exit). `--once` output
 is unaffected: a terminal can't host the follow pane, so the rows stay
 plain text there.
+
+### `http_checks` — is each site up?
+
+```yaml
+- name: acme_sites
+  type: http_checks
+  sites:
+    - name: intranet
+      url: https://intranet.acme.internal/
+      insecure: true            # self-signed cert
+    - url: http://10.0.0.20:8000/api/health
+    - name: sso portal
+      url: https://portal.acme.internal/
+      expect: [200, 302, 401]   # codes that count as up
+  host: sshacmevm               # optional: probe from this host
+  jump: sshacme                 #   through this hop
+  interval: 120
+```
+
+One `curl` GET per site, body discarded, redirects **not** followed (a 3xx
+to a login page means the site is up — SSO fronts count as alive), a hard
+per-site deadline (`max_time`, default 10s). A site is up when it answers
+with any 2xx/3xx, or with one of its `expect` codes when that is set (e.g.
+`expect: 401` for an API that demands auth on its root). Rows render as
+
+```
+✓ intranet       200 · 14ms
+✗ api health     DOWN · (7) Failed to connect to 10.0.0.20 port 8000 ...
+```
+
+each site clickable (opens it in the panel's `browser:` if set), the panel
+subtitle reads `all 3 up` or `2 up · 1 DOWN`, and any down site flags the
+panel red the way a fetch error would — while still showing every row, so
+the one that broke is obvious.
+
+**Where the probe runs is the point.** With no `host`, the sites are probed
+from the machine running the board — right for public sites. Internal sites
+are usually reachable only from inside a network the board machine isn't
+on, so `host` (plus an optional `jump`) moves the probe onto that machine
+over the **same ssh chain an `ssh_command` panel uses**: the board sends a
+single sh one-liner that curls every site and reads the results back, so
+the sites are checked exactly the way their users reach them (DNS, cert
+and all). A remote vantage host needs `curl` and a POSIX shell
+(Linux/macOS). When the board happens to run *on* the vantage host, the ssh
+hop is skipped and curl runs locally — no shell involved, so a board on
+Windows works too. `timeout` (default 60s) bounds the ssh round trip when
+probing remotely. `insecure: true` skips certificate verification for a
+site with a self-signed or internal-CA cert.
 
 ### `github_prs` — PRs awaiting your review, one panel per account
 

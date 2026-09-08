@@ -38,6 +38,27 @@
   browser: chrome            # optional: open clicked PRs in this browser
   interval: 180
 
+# --- http_checks: is each site up? one curl GET per site -------------------
+- name: acme_sites
+  type: http_checks
+  sites:
+    - name: intranet          # optional label; defaults to the url's host
+      url: https://intranet.acme.internal/
+      insecure: true          # optional: skip cert verification (self-signed)
+    - name: api health
+      url: https://intranet.acme.internal/api/health
+      insecure: true
+    - url: http://10.0.0.20:8000/api/health
+    - name: sso portal
+      url: https://portal.acme.internal/
+      expect: [200, 302, 401] # optional: codes that count as up (default any 2xx/3xx)
+  host: sshacmevm             # optional: probe FROM this host (through the ssh chain)
+  jump: sshacme               #   instead of from the machine running the board
+  browser: edge               # optional: open clicked sites in this browser
+  max_time: 10                # optional per-site curl deadline (seconds), default 10
+  interval: 120               # default 120 for http_checks
+  timeout: 60                 # optional ssh timeout when probing remotely, default 60
+
 # --- bitbucket_prs: open PRs listing you as reviewer (or authored by you) --
 - name: acme_bitbucket_prs
   type: bitbucket_prs

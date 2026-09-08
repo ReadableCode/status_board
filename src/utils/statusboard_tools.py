@@ -3,8 +3,10 @@
 
 import os
 import re
+import shlex
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import requests
@@ -33,12 +35,19 @@ from readable_utils.ssh_tools import (  # noqa: F401 - options/destination re-ex
 # %%
 # Variables #
 
-PANEL_TYPES = ("ssh_command", "github_prs", "bitbucket_prs")
+PANEL_TYPES = ("ssh_command", "github_prs", "bitbucket_prs", "http_checks")
 
 # Per-type defaults: refresh interval (seconds) and, where relevant, timeouts
-DEFAULT_INTERVALS = {"ssh_command": 300, "github_prs": 180, "bitbucket_prs": 180}
+DEFAULT_INTERVALS = {"ssh_command": 300, "github_prs": 180, "bitbucket_prs": 180, "http_checks": 120}
 DEFAULT_SSH_TIMEOUT = 60
 DEFAULT_HTTP_TIMEOUT = 30
+# http_checks: per-site curl --max-time (seconds), overridable per panel
+DEFAULT_PROBE_TIMEOUT = 10
+# http_checks probe output markers. curl reads a -w format that STARTS with
+# "@" from a file, so neither marker may begin with one (the @@STATS@@ style
+# of the host-stats line is not reusable here).
+SITE_MARKER = "==SITE=="
+HTTP_CHECK_MARKER = "==CHECK=="
 DEFAULT_GITHUB_API = "https://api.github.com"
 BITBUCKET_API = "https://api.bitbucket.org/2.0"
 
@@ -60,17 +69,21 @@ class PanelResult:
 
     kind is "ansi" (body: raw terminal text to render as-is) or "links"
     (body: list of {"text", "url", "meta"} rows the TUI turns into clickable
-    lines). A failed fetch has ok=False and the error text in body. stats is
-    the parsed host-stats dict when the panel collects them (None otherwise,
-    or when the remote failed to emit/parse them).
+    lines; an optional "tail" is appended dimmed on the same line). A failed
+    fetch has ok=False and the error text in body. stats is the parsed
+    host-stats dict when the panel collects them (None otherwise, or when the
+    remote failed to emit/parse them). alert marks a fetch that WORKED but
+    found something wrong (a site down) - the panel renders its rows normally
+    and is flagged like an error, instead of collapsing to an error message.
     """
 
-    def __init__(self, ok, kind, body, summary="", stats=None):
+    def __init__(self, ok, kind, body, summary="", stats=None, alert=False):
         self.ok = ok
         self.kind = kind
         self.body = body
         self.summary = summary
         self.stats = stats
+        self.alert = alert
         self.fetched_at = time.time()
 
     @classmethod
@@ -162,6 +175,7 @@ def _validate_panel(panel, config_path):
         "ssh_command": ("host", "command"),
         "github_prs": ("token_env",),
         "bitbucket_prs": ("workspace", "username_env", "app_password_env"),
+        "http_checks": ("sites",),
     }[panel["type"]]
     missing = [key for key in required if not panel.get(key)]
     if panel.get("host_stats"):
@@ -179,6 +193,35 @@ def _validate_panel(panel, config_path):
         )
     if panel.get("log_link"):
         _validate_log_link(panel, config_path)
+    if panel["type"] == "http_checks":
+        _validate_sites(panel, config_path)
+
+
+def _validate_sites(panel, config_path):
+    """
+    ``sites`` is a non-empty list of ``{url, name?, expect?, insecure?}``
+    mappings: ``expect`` is the status code (or list of codes) that counts as
+    up (default: any 2xx/3xx), ``insecure`` skips certificate verification
+    for self-signed internal hosts. An optional ``host``/``jump`` pair moves
+    the probe to that machine (through the usual ssh chain) - a jump without
+    a host has nothing to hop to.
+    """
+    prefix = f"Statusboard panel '{panel['name']}' in {config_path}"
+    sites = panel["sites"]
+    if not isinstance(sites, list) or not sites:
+        raise ValueError(f"{prefix}: sites must be a non-empty list of {{url, name, expect, insecure}} mappings")
+    for site in sites:
+        if not isinstance(site, dict) or not site.get("url"):
+            raise ValueError(f"{prefix}: every site needs a url: {site}")
+        if not re.match(r"https?://", str(site["url"])):
+            raise ValueError(f"{prefix}: site url must start with http:// or https://: {site['url']}")
+        expect = site.get("expect")
+        if expect is not None:
+            codes = expect if isinstance(expect, list) else [expect]
+            if not codes or not all(isinstance(code, int) and not isinstance(code, bool) for code in codes):
+                raise ValueError(f"{prefix}: site expect must be a status code or list of codes: {site['url']}")
+    if panel.get("jump") and not panel.get("host"):
+        raise ValueError(f"{prefix}: jump needs a host to hop to")
 
 
 def _validate_log_link(panel, config_path):
@@ -336,6 +379,192 @@ def fetch_ssh_command(panel, credentials_root, local_hostname=""):
     if panel.get("host_stats"):
         output, stats = _split_host_stats(output)
     return PanelResult(True, "ansi", output, f"exit {completed.returncode}", stats=stats)
+
+
+def curl_argv(site, max_time, devnull=os.devnull):
+    """
+    The curl argv that probes one site: a plain GET with the body discarded,
+    no redirect following (a 3xx to a login page means the site IS up), a
+    hard per-request deadline, and one machine-readable trailer line
+    (``==CHECK== <http_code> <time_total>``) the parser reads back. Errors
+    stay on stderr as curl's own ``curl: (N) reason`` line, which the caller
+    merges into the same stream. ``devnull`` is the probing host's null
+    device (``/dev/null`` when the probe runs over ssh on a POSIX host).
+    """
+    argv = ["curl", "-sS", "-o", devnull, "--max-time", str(max_time)]
+    if site.get("insecure"):
+        argv.append("-k")
+    argv += ["-w", f"{HTTP_CHECK_MARKER} %{{http_code}} %{{time_total}}\\n", str(site["url"])]
+    return argv
+
+
+def http_checks_command(panel):
+    """
+    One POSIX sh command line that probes every site of an http_checks panel
+    from a remote host: each site's curl, prefixed with a ``==SITE== <index>``
+    line so the output splits back into per-site blocks. Same curl flags as
+    the local probe, so the two vantage points are parsed and rendered
+    identically. Requires curl and a POSIX shell on the host (Linux/macOS).
+    """
+    max_time = panel.get("max_time", DEFAULT_PROBE_TIMEOUT)
+    parts = []
+    for index, site in enumerate(panel["sites"]):
+        argv = curl_argv(site, max_time, devnull="/dev/null")
+        parts.append(f"echo '{SITE_MARKER} {index}'; {shlex.join(argv)} 2>&1")
+    return "; ".join(parts)
+
+
+def split_site_blocks(output):
+    """Remote probe output -> {site_index: that site's curl output}, keyed by the ==SITE== lines."""
+    blocks: dict = {}
+    current = None
+    for line in output.splitlines():
+        if line.startswith(SITE_MARKER):
+            try:
+                current = int(line.split()[1])
+            except (IndexError, ValueError):
+                current = None
+                continue
+            blocks[current] = []
+        elif current is not None:
+            blocks[current].append(line)
+    return {index: "\n".join(lines) for index, lines in blocks.items()}
+
+
+def parse_http_check(output):
+    """
+    One site's merged curl output -> ``{"code", "seconds", "error"}``.
+    ``code`` is the HTTP status (0 when no response was received - curl still
+    prints its -w trailer on failure), ``error`` curl's own reason line minus
+    the ``curl:`` prefix, or a generic one when curl printed nothing at all.
+    """
+    code, seconds, error = None, None, None
+    for line in output.splitlines():
+        if line.startswith(HTTP_CHECK_MARKER):
+            fields = line.split()
+            try:
+                code, seconds = int(fields[1]), float(fields[2])
+            except (IndexError, ValueError):
+                continue
+        elif line.startswith("curl:"):
+            error = line[len("curl:"):].strip()
+    if code is None and error is None:
+        error = "no response from curl"
+    return {"code": code or 0, "seconds": seconds, "error": error}
+
+
+def site_is_up(site, check):
+    """A site is up when it answered with an expected code (any 2xx/3xx unless ``expect`` narrows it)."""
+    code = check["code"]
+    if not code:
+        return False
+    expect = site.get("expect")
+    if expect is None:
+        return 200 <= code < 400
+    return code in (expect if isinstance(expect, list) else [expect])
+
+
+def site_label(site):
+    """The row text for a site: its name, else the url's host (and port)."""
+    if site.get("name"):
+        return str(site["name"])
+    url = str(site["url"])
+    return re.sub(r"^https?://", "", url).split("/", 1)[0] or url
+
+
+def http_check_rows(sites, checks):
+    """
+    Turn per-site probe results into link rows (click opens the site) and a
+    summary. Returns (rows, summary, down_count). Each row's ``tail`` pads
+    the status column into alignment - the row text itself is the link, so
+    padding there would underline blank space.
+    """
+    labels = [site_label(site) for site in sites]
+    width = max(len(label) for label in labels)
+    rows, down = [], 0
+    for site, check, label in zip(sites, checks, labels):
+        pad = " " * (width - len(label))
+        if site_is_up(site, check):
+            badge, badge_style, tail_style = "✓", "bold green", "dim"
+            status = f"{check['code']} · {check['seconds'] * 1000:.0f}ms"
+        else:
+            down += 1
+            badge, badge_style, tail_style = "✗", "bold red", "red"
+            reason = check["error"] or f"unexpected status {check['code']}"
+            status = f"DOWN · {check['code']} · {reason}" if check["code"] else f"DOWN · {reason}"
+        rows.append({
+            "badge": badge,
+            "badge_style": badge_style,
+            "text": label,
+            "url": str(site["url"]),
+            "tail": f"{pad}{status}",
+            "tail_style": tail_style,
+            "dim": False,
+        })
+    up = len(sites) - down
+    summary = f"all {up} up" if not down else f"{up} up · {down} DOWN"
+    return rows, summary, down
+
+
+def _run_local_http_checks(sites, max_time):
+    """Probe every site from this machine, concurrently - one curl process per site, no shell."""
+    def probe(site):
+        argv = curl_argv(site, max_time)
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, encoding="utf-8", errors="replace",
+                timeout=max_time + 5, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return f"curl: (28) no answer within {max_time}s"
+        return f"{completed.stdout}\n{completed.stderr}"
+
+    with ThreadPoolExecutor(max_workers=min(8, len(sites))) as pool:
+        return dict(enumerate(pool.map(probe, sites)))
+
+
+def fetch_http_checks(panel, credentials_root, local_hostname=""):
+    """
+    Probe each site with curl and report up/down per site. With ``host`` set
+    the probes run on that machine over the same ssh chain an ssh_command
+    panel uses (jump hop included) - the way to watch sites that are only
+    reachable from inside a network, from wherever the board happens to run.
+    When the chain resolves the host to THIS machine (the board is running
+    on the vantage host) or no host is set, curl runs locally per site - no
+    shell involved, so a Windows board works too.
+    """
+    sites = panel["sites"]
+    max_time = panel.get("max_time", DEFAULT_PROBE_TIMEOUT)
+    argv = None
+    if panel.get("host"):
+        argv = build_ssh_argv(panel, credentials_root, local_hostname, command=http_checks_command(panel))
+    if argv is None or argv[0] != "ssh":
+        try:
+            outputs = _run_local_http_checks(sites, max_time)
+        except FileNotFoundError:
+            return PanelResult.error("curl not found on PATH")
+    else:
+        timeout = panel.get("timeout", DEFAULT_SSH_TIMEOUT)
+        try:
+            completed = subprocess.run(
+                argv, capture_output=True, encoding="utf-8", errors="replace",
+                timeout=timeout, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return PanelResult.error(f"ssh timed out after {timeout}s: {' '.join(argv[:-1])}")
+        except FileNotFoundError:
+            return PanelResult.error("ssh not found on PATH")
+        # the script's exit status is the LAST curl's, so a down site makes
+        # ssh exit non-zero with the probe output intact - only an empty
+        # stdout means the chain itself failed
+        if not completed.stdout.strip():
+            return PanelResult.error(completed.stderr.strip() or f"ssh exited {completed.returncode}")
+        outputs = split_site_blocks(completed.stdout)
+    checks = [parse_http_check(outputs.get(index, "")) for index in range(len(sites))]
+    rows, summary, down = http_check_rows(sites, checks)
+    if panel.get("host"):
+        summary += f" · from {panel['host']}"
+    return PanelResult(True, "links", rows, summary, alert=down > 0)
 
 
 def fetch_github_prs(panel):
@@ -745,6 +974,8 @@ def fetch_panel(panel, credentials_root, local_hostname=""):
             return fetch_ssh_command(panel, credentials_root, local_hostname)
         if panel["type"] == "github_prs":
             return fetch_github_prs(panel)
+        if panel["type"] == "http_checks":
+            return fetch_http_checks(panel, credentials_root, local_hostname)
         return fetch_bitbucket_prs(panel)
     except Exception as error:  # noqa: BLE001 - a panel must never take the board down
         return PanelResult.error(f"{type(error).__name__}: {error}")

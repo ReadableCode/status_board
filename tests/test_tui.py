@@ -86,3 +86,37 @@ def test_refresh_pane_without_focus_or_hover_is_a_noop(monkeypatch):
 
 
 # %%
+
+# %%
+# Alert state #
+
+
+def test_alert_result_flags_panel_red_but_keeps_rows(monkeypatch):
+    from src import status_board
+
+    rows = [{"badge": "✗", "badge_style": "bold red", "text": "intranet", "url": "https://x/",
+             "tail": "DOWN · (7) Failed to connect", "tail_style": "red"}]
+
+    def fake_fetch(panel, credentials_root, local_hostname=""):
+        return PanelResult(True, "links", rows, "0 up · 1 DOWN", alert=True)
+
+    monkeypatch.setattr(status_board, "fetch_panel", fake_fetch)
+    panel = dict(make_panels()[0], name="sites", type="http_checks", sites=[{"url": "https://x/"}])
+    app_class = status_board.build_app([panel], "TESTHOST")
+
+    async def scenario():
+        app = app_class()
+        async with app.run_test() as pilot:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            widget = app.query("Panel").first()
+            output = widget.query_one(".panel-output")
+            return widget.has_class("error"), widget.border_subtitle, str(output.render())
+
+    is_error, subtitle, body = asyncio.run(scenario())
+    assert is_error                              # a down site flags the panel like a fetch error
+    assert subtitle.startswith("0 up · 1 DOWN")
+    assert "intranet" in body and "DOWN" in body  # ...while the rows still render
+
+
+# %%

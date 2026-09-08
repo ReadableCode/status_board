@@ -8,6 +8,7 @@ import yaml
 from readable_utils.inventory_tools import credentials_context, find_credentials_dirs
 from utils.statusboard_tools import (
     DEFAULT_INTERVALS,
+    DEFAULT_PROBE_TIMEOUT,
     DEFAULT_SSH_TIMEOUT,
     PANEL_TYPES,
     _validate_panel,
@@ -21,7 +22,7 @@ from utils.statusboard_tools import (
 # Authoring order for wizard-written panels, so the generated YAML reads like
 # the hand-written examples (name/type first, connection, then behavior).
 FIELD_ORDER = (
-    "name", "type", "host", "jump", "command", "host_stats", "log_link",
+    "name", "type", "host", "jump", "command", "host_stats", "log_link", "sites", "max_time",
     "token_env", "search", "workspace", "repos", "username_env", "app_password_env",
     "env_file", "browser", "interval", "timeout", "note",
 )
@@ -190,6 +191,65 @@ def _prompt_log_link(console):
         console.print("[red]command must contain a {job} placeholder[/red]")
 
 
+def _prompt_site(console, first):
+    """One http_checks site: url (required), optional display name, cert skip and expected codes."""
+    from rich.prompt import Confirm, Prompt
+
+    while True:
+        url = Prompt.ask("site url" + ("" if first else " (empty to stop adding sites)"), default="", console=console)
+        url = (url or "").strip()
+        if not url and not first:
+            return None
+        if re.match(r"https?://", url):
+            break
+        console.print("[red]url must start with http:// or https://[/red]")
+    site = {"url": url}
+    name = _ask_optional("display name (empty to show the host)", console)
+    if name:
+        site["name"] = name
+    if Confirm.ask("skip certificate verification (self-signed internal host)?", default=False, console=console):
+        site["insecure"] = True
+    while True:
+        expect = _ask_optional("status codes that count as up, comma-separated (empty = any 2xx/3xx)", console)
+        if not expect:
+            break
+        codes = [code.strip() for code in expect.split(",") if code.strip()]
+        if all(code.isdigit() for code in codes):
+            site["expect"] = [int(code) for code in codes] if len(codes) > 1 else int(codes[0])
+            break
+        console.print("[red]codes must be integers[/red]")
+    return site
+
+
+def _prompt_http_checks_fields(panel, target, credentials_root, console):
+    from rich.prompt import IntPrompt
+
+    panel["sites"] = []
+    while True:
+        site = _prompt_site(console, first=not panel["sites"])
+        if site is None:
+            break
+        panel["sites"].append(site)
+    host = _prompt_host(
+        "probe from host (inventory name or alias; empty to probe from the machine running the board)",
+        target["base_dir"], credentials_root, console, optional=True,
+    )
+    if host:
+        panel["host"] = host
+        jump = _prompt_host(
+            "jump hop (inventory name or alias, empty for none)",
+            target["base_dir"], credentials_root, console, optional=True,
+        )
+        if jump:
+            panel["jump"] = jump
+        timeout = IntPrompt.ask("ssh timeout (seconds)", default=DEFAULT_SSH_TIMEOUT, console=console)
+        if timeout != DEFAULT_SSH_TIMEOUT:
+            panel["timeout"] = timeout
+    max_time = IntPrompt.ask("per-site curl deadline (seconds)", default=DEFAULT_PROBE_TIMEOUT, console=console)
+    if max_time != DEFAULT_PROBE_TIMEOUT:
+        panel["max_time"] = max_time
+
+
 def _prompt_env_file(panel, target, console):
     env_file = _ask_optional(
         f"env_file with the token(s), relative to {target['base_dir']} (empty to use real env vars only)", console
@@ -256,12 +316,12 @@ def run_wizard(credentials_root, repo_root=None):
         console.print(f"[red]'{name}' is empty or already taken[/red]")
 
     panel = {"name": name, "type": panel_type}
-    if panel_type == "ssh_command":
-        _prompt_ssh_fields(panel, target, credentials_root, console)
-    elif panel_type == "github_prs":
-        _prompt_github_fields(panel, target, console)
-    else:
-        _prompt_bitbucket_fields(panel, target, console)
+    {
+        "ssh_command": lambda: _prompt_ssh_fields(panel, target, credentials_root, console),
+        "github_prs": lambda: _prompt_github_fields(panel, target, console),
+        "bitbucket_prs": lambda: _prompt_bitbucket_fields(panel, target, console),
+        "http_checks": lambda: _prompt_http_checks_fields(panel, target, credentials_root, console),
+    }[panel_type]()
 
     if panel_type != "ssh_command":
         browser = _ask_optional("browser for clicked links (edge/chrome/firefox/safari; empty for OS default)", console)

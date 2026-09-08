@@ -88,6 +88,8 @@ def legend_text():
         ("💬", "dim", "you commented"),
         ("⬆", "bold magenta", "your PR"),
         ("◌", "dim", "draft, parked"),
+        ("✓", "bold green", "site up"),
+        ("✗", "bold red", "site down"),
     ]):
         if index:
             text.append("   ", style="dim")
@@ -122,6 +124,8 @@ def result_renderable(result, browser=None, tui=False, log_link=None, panel_name
     (the terminal handles clicks), but inside the TUI Textual captures the
     mouse, so rows carry an @click action meta that routes through
     app.action_open_link - which is also what honors the panel's browser.
+    A row's optional "tail" (an http_checks status column) stays on the same
+    line after the link; "meta" goes on its own indented line below.
     """
     if not result.ok:
         return Text(result.body, style="red")
@@ -149,6 +153,8 @@ def result_renderable(result, browser=None, tui=False, log_link=None, panel_name
         else:
             style = Style(bold=not dim, dim=dim, link=row["url"])
         text.append(row["text"], style=style)
+        if row.get("tail"):
+            text.append(f"  {row['tail']}", style=row.get("tail_style", "dim"))
         if row.get("meta"):
             text.append(f"\n    {row['meta']}", style="dim")
     return text
@@ -305,7 +311,9 @@ def build_panel_widget(local_hostname):
             self.app.call_from_thread(self._show, result)
 
         def _show(self, result):
-            self.set_class(not result.ok, "error")
+            # a fetch that worked but found a site down is flagged like an
+            # error (red border) while still rendering its rows
+            self.set_class(not result.ok or result.alert, "error")
             state = result.summary or ("ok" if result.ok else "error")
             self.border_subtitle = f"{state} · {time.strftime('%H:%M:%S')}"
             if self.stats_only and result.ok:
@@ -464,7 +472,8 @@ def run_once(panels, local_hostname):
             last_context = panel["_context"]
             console.rule(f"[bold]══ {last_context.replace('_', ' ')} ══[/bold]", style="cyan", characters="═")
         state = result.summary or ("ok" if result.ok else "error")
-        console.rule(f"[bold]{panel['name']}[/bold] · {state}", style="green" if result.ok else "red")
+        healthy = result.ok and not result.alert
+        console.rule(f"[bold]{panel['name']}[/bold] · {state}", style="green" if healthy else "red")
         if result.body or not (result.ok and panel.get("host_stats")):
             console.print(result_renderable(result))
         if result.ok and panel.get("host_stats"):

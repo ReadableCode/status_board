@@ -129,3 +129,17 @@ def test_append_panel_handles_missing_trailing_newline(tmp_path):
 
 
 # %%
+
+
+def test_format_panel_yaml_http_checks_round_trips():
+    panel = {
+        "name": "acme_sites", "type": "http_checks", "interval": 120, "host": "sshvm", "jump": "jump1",
+        "sites": [{"url": "https://intranet.acme.internal/", "name": "intranet", "insecure": True},
+                  {"url": "http://10.0.0.20:8000/api/health", "expect": [200, 401]}],
+    }
+    block = wizard_tools.format_panel_yaml(panel)
+    lines = block.splitlines()
+    assert lines[0] == "- name: acme_sites"
+    assert lines[1] == "  type: http_checks"
+    assert lines.index("  host: sshvm") < lines.index("  sites:") < lines.index("  interval: 120")
+    assert yaml.safe_load(block) == [panel]
