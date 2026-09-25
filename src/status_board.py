@@ -399,7 +399,7 @@ def build_app(panels, local_hostname):
         Panel:focus { border: round $accent; }
         Panel.error { border: round red; }
         .panel-output { height: auto; max-height: 26; overflow-y: auto; }
-        .panel-stats { height: 1; margin-top: 1; }
+        .panel-stats { height: auto; margin-top: 1; }
         .panel-footer { height: 1; margin-top: 1; }
         .panel-footer ProgressBar { width: 1fr; }
         .panel-footer Bar { width: 1fr; }

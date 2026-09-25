@@ -152,7 +152,11 @@ def _prompt_ssh_fields(panel, target, credentials_root, console):
     )
     if jump:
         panel["jump"] = jump
-    if Confirm.ask("append host_stats meters (disk/cpu/mem, Linux hosts only)?", default=False, console=console):
+    if Confirm.ask(
+        "append host_stats meters (every physical drive, cpu, mem; Linux and macOS hosts)?",
+        default=False,
+        console=console,
+    ):
         panel["host_stats"] = True
     command = _ask_optional(
         "remote command" + (" (empty for a stats-only panel)" if panel.get("host_stats") else ""), console

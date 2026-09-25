@@ -148,10 +148,15 @@ def test_build_ssh_argv_appends_host_stats(tmp_path):
     assert argv[-1] == "tail -F x.log"
 
 
-STATS_LINE = "@@STATS@@ disk=50331648/62914560 load=0.19,0.15,0.22 cpu=4 mem=2018/15992"
+STATS_LINE = (
+    "@@STATS@@ load=0.19,0.15,0.22 cpu=4 mem=2018/15992 "
+    "disk=/:50331648/62914560|/Volumes/My Passport:1048576/2097152"
+)
 PARSED_STATS = {
-    "disk_used_kb": 50331648,
-    "disk_total_kb": 62914560,
+    "disks": [
+        {"label": "/", "used_kb": 50331648, "total_kb": 62914560},
+        {"label": "/Volumes/My Passport", "used_kb": 1048576, "total_kb": 2097152},
+    ],
     "load": (0.19, 0.15, 0.22),
     "cpus": 4,
     "mem_used_mb": 2018,
@@ -200,9 +205,14 @@ def test_fetch_ssh_command_missing_stats_line_leaves_output_untouched(tmp_path, 
 
 
 def test_parse_host_stats_garbled_line_returns_none():
-    assert statusboard_tools._parse_host_stats("@@STATS@@ disk=oops load=1,2,3 cpu=4 mem=1/2") is None
-    assert statusboard_tools._parse_host_stats("@@STATS@@ disk=1/2 load=1,2 cpu=4 mem=1/2") is None
+    assert statusboard_tools._parse_host_stats("@@STATS@@ load=1,2,3 cpu=4 mem=1/2 disk=oops") is None
+    assert statusboard_tools._parse_host_stats("@@STATS@@ load=1,2 cpu=4 mem=1/2 disk=/:1/2") is None
     assert statusboard_tools._parse_host_stats("@@STATS@@") is None
+
+
+def test_parse_host_stats_no_drives_is_an_empty_list():
+    stats = statusboard_tools._parse_host_stats("@@STATS@@ load=1,2,3 cpu=4 mem=1/2 disk=")
+    assert stats["disks"] == [] and stats["cpus"] == 4
 
 
 def test_log_link_valid_loads(tmp_path):
@@ -371,19 +381,26 @@ def test_stats_renderable_meters_and_values():
 
     text = stats_renderable(PARSED_STATS)
     plain = text.plain
-    # three labeled meters, each a full-width bracketed bar
-    assert plain.count("▕") == 3 and plain.count("▏") == 3
+    # one line per drive (labels padded so the bars align), then cpu + mem on one line
+    lines = plain.splitlines()
+    assert len(lines) == 3
+    longest = "disk /Volumes/My Passport"
+    assert lines[0].startswith("disk /".ljust(len(longest)) + " ▕") and lines[1].startswith(longest + " ▕")
+    assert lines[2].count("▕") == 2
+    # four labeled meters, each a full-width bracketed bar
+    assert plain.count("▕") == 4 and plain.count("▏") == 4
     for segment in plain.split("▕")[1:]:
         bar = segment.split("▏")[0]
         assert len(bar) == METER_WIDTH
         assert set(bar) <= {METER_FILLED, METER_EMPTY}
-    # readouts: disk 80%, cpu load/cores 4%, mem 13%
+    # readouts: disks 80% and 50%, cpu load/cores 4%, mem 13%
     assert " 80% 48G of 60G" in plain
+    assert " 50% 1G of 2G" in plain
     assert "load 0.19 0.15 0.22 · 4 cores" in plain
     assert " 13% 2.0G of 15.6G" in plain
     # disk bar is mostly full, cpu bar nearly empty
     disk_bar = plain.split("▕")[1].split("▏")[0]
-    cpu_bar = plain.split("▕")[2].split("▏")[0]
+    cpu_bar = plain.split("▕")[3].split("▏")[0]
     assert disk_bar.count(METER_FILLED) == round(0.8 * METER_WIDTH)
     assert cpu_bar.count(METER_FILLED) <= 1
 

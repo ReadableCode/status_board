@@ -135,11 +135,14 @@ ANSI colors in the command's output are rendered as-is.
 
 #### `host_stats` — htop-style disk / cpu / memory meters for the host
 
-Add `host_stats: true` to any `ssh_command` panel to get a row of htop-style
-gradient meters for the host:
+Add `host_stats: true` to any `ssh_command` panel to get htop-style
+gradient meters for the host, one line per physical drive and then cpu and
+memory:
 
 ```
-disk / ▕██████████████████░░░░▏  80% 48G of 60G    cpu ▕█░░░…▏   4% load 0.19 0.15 0.22 · 4 cores    mem ▕███░░░…▏  13% 2.0G of 15.6G
+disk /                ▕██████████████████░░░░▏  80% 48G of 60G
+disk /mnt/Ext_Eight_TB ▕█████████████████████░▏  96% 7111G of 7450G
+cpu ▕█░░░░…▏   4% load 0.19 0.15 0.22 · 4 cores    mem ▕███░░░…▏  13% 2.0G of 15.6G
 ```
 
 Each bar fills with a smooth green→yellow→red ramp (the same scale htop
@@ -151,12 +154,21 @@ never pushes them out of view), as the entire body of a stats-only panel,
 and in `--once` output.
 
 Everything comes from numbers the kernel already maintains — nothing is
-installed or tracked on the host: `df -Pk /` for disk, `/proc/loadavg` for
-CPU (the same 1/5/15-minute averages `top`'s header shows, so a panel on a
-5-minute `interval` reads the 5-minute column as its per-refresh average —
-the cpu bar is the 5-minute load over the core count), and `free -m` for
-memory. Linux keeps no memory average, so the `mem` figure is a
-point-in-time reading at fetch. Linux hosts only.
+installed or tracked on the host. Disks are **physical drives, not mounts**:
+every `df` row is walked back to the drive it lives on (partition, LVM and
+md on Linux, APFS container to physical store on macOS) and summed per
+drive, so a boot ssd plus an 8T data drive is two meters, while the dozen
+partitions and system volumes an OS mounts off one drive fold into that
+drive's single figure. Loop devices, zram and mounted disk images are not
+drives and never appear; macOS's `/System/Volumes/*` and Recovery volumes
+belong to the OS and are skipped. Each drive is labeled with the shortest
+mount point it carries (`/` for the boot drive) and the boot drive leads.
+CPU is `/proc/loadavg` (the same 1/5/15-minute averages `top`'s header
+shows, so a panel on a 5-minute `interval` reads the 5-minute column as its
+per-refresh average — the cpu bar is the 5-minute load over the core
+count), memory is `free -m`, with `sysctl` and `vm_stat` standing in on
+macOS. Neither kernel keeps a memory average, so the `mem` figure is a
+point-in-time reading at fetch. Linux and macOS hosts.
 
 A panel can also be **stats-only** — set `host_stats: true` and omit
 `command` entirely for a host that has nothing else to report:
