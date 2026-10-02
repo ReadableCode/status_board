@@ -59,6 +59,16 @@
   interval: 120               # default 120 for http_checks
   timeout: 60                 # optional ssh timeout when probing remotely, default 60
 
+# --- claude_usage: Claude allowance left on a host's claude.ai login -------
+# Follows whatever the host's ~/.claude/settings.json is set up for: plan
+# limits with reset times on a claude.ai login, token totals on Bedrock.
+- name: acme_claude_usage
+  type: claude_usage
+  host: sshacmevm             # optional: whose Claude Code to report (default: this machine)
+  jump: sshacme               # optional jump hop
+  interval: 300               # default 300 for claude_usage
+  timeout: 60                 # optional probe timeout, default 60
+
 # --- bitbucket_prs: open PRs listing you as reviewer (or authored by you) --
 - name: acme_bitbucket_prs
   type: bitbucket_prs

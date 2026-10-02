@@ -2,6 +2,7 @@
 # Imports #
 
 import argparse
+import math
 import platform
 import re
 import shlex
@@ -10,6 +11,7 @@ import sys
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from itertools import groupby
 
 from config import grandparent_dir, parent_dir
@@ -17,14 +19,24 @@ from readable_utils.host_stats_tools import (  # noqa: F401 - meter pieces re-ex
     METER_EMPTY,
     METER_FILLED,
     METER_WIDTH,
+    append_meter,
     ramp_style,
     stats_renderable,
 )
 from readable_utils.host_tools import get_uppercase_hostname
 from rich.console import Console
+from rich.measure import Measurement
 from rich.style import Style
 from rich.text import Text
-from utils.statusboard_tools import build_ssh_argv, fetch_panel, load_panels
+from utils.statusboard_tools import (
+    build_ssh_argv,
+    claude_plan_label,
+    claude_spend,
+    claude_usage_limits,
+    compact_count,
+    fetch_panel,
+    load_panels,
+)
 
 # %%
 # Variables #
@@ -116,19 +128,186 @@ def mark_log_links(text, log_link, panel_name):
     return text
 
 
+def reset_text(resets_at, now=None):
+    """
+    When a limit resets, in this machine's zone - a bare clock time today,
+    the weekday within the week, the date beyond - plus the countdown.
+    """
+    if resets_at is None:
+        return "no reset scheduled"
+    now = now or datetime.now(timezone.utc)
+    seconds = int((resets_at - now).total_seconds())
+    if seconds <= 0:
+        return "resetting now"
+    local = resets_at.astimezone()
+    if local.date() == now.astimezone().date():
+        when = local.strftime("%H:%M")
+    elif seconds < 6 * 86400:
+        when = local.strftime("%a %H:%M")
+    else:
+        when = local.strftime("%a %m-%d %H:%M")
+    days, rest = divmod(seconds, 86400)
+    hours, minutes = rest // 3600, rest % 3600 // 60
+    return f"resets {when} (in {days}d {hours}h)" if days else f"resets {when} (in {hours}h {minutes:02d}m)"
+
+
+def claude_usage_renderable(report, now=None):
+    """
+    A claude_usage panel body. On a claude.ai subscription: one htop-style
+    meter per plan limit (session, weekly, each model-scoped weekly) reading
+    used and left with the reset time, plus usage credits when enabled.
+    On Bedrock there is no allowance to meter, so it shows the configured
+    model and this host's Claude Code token tally for today and the last
+    7 days.
+    """
+    text = Text()
+    host = report.get("host") or "?"
+    if report["mode"] == "bedrock":
+        where = " · ".join(part for part in (report.get("model"), report.get("region")) if part)
+        text.append("bedrock", style="bold")
+        text.append(f" · {where} · on {host}\n", style="dim")
+        text.append("pay per token: no allowance, nothing resets\n", style="dim")
+        for index, (label, key) in enumerate((("today", "today"), ("7 days", "week"))):
+            tally = report["tokens"][key]
+            if index:
+                text.append("\n")
+            text.append(f"{label:<7}", style="bold")
+            text.append(f"{tally['turns']:>6} turns · ")
+            text.append(f"{compact_count(tally['output'])} out", style="bold")
+            text.append(
+                f" · {compact_count(tally['input'])} in · {compact_count(tally['cache_read'])} cache read"
+                f" · {compact_count(tally['cache_write'])} cache write",
+                style="dim",
+            )
+        return text
+
+    usage = report.get("usage") or {}
+    text.append(f"claude.ai {claude_plan_label(report)}", style="bold")
+    text.append(f" · on {host}", style="dim")
+    rows = claude_usage_limits(usage)
+    spend = claude_spend(usage)
+    if not rows and not spend:
+        text.append("\nno plan limits reported", style="dim")
+        return text
+    width = max(len(row["label"]) for row in rows + ([spend] if spend else []))
+    for row in rows:
+        text.append("\n")
+        fraction = row["percent"] / 100
+        append_meter(
+            text, row["label"].ljust(width), fraction,
+            f"{row['percent']:>3.0f}% used · {max(0.0, 100 - row['percent']):.0f}% left",
+        )
+        text.append(f" · {reset_text(row['resets_at'], now)}", style="dim")
+    if spend:
+        text.append("\n")
+        amount = f"{spend['used']} of {spend['limit']}" if spend["limit"] else f"{spend['used']} spent"
+        append_meter(text, spend["label"].ljust(width), spend["percent"] / 100, f"{spend['percent']:>3.0f}% · {amount}")
+    return text
+
+
+def link_style(row, browser=None, tui=False):
+    """
+    The style that makes a row's text a link. --once emits a plain OSC 8
+    hyperlink (the terminal handles the click), but inside the TUI Textual
+    captures the mouse, so the row carries an @click action meta that routes
+    through app.action_open_link - which is also what honors the panel's
+    browser.
+    """
+    dim = bool(row.get("dim"))
+    if tui:
+        return Style(
+            bold=not dim, dim=dim, underline=True,
+            meta={"@click": f"app.open_link({row['url']!r}, {browser!r})"},
+        )
+    return Style(bold=not dim, dim=dim, link=row["url"])
+
+
+def site_cell(row, label_width, browser=None, tui=False):
+    """One http_checks row: badge, linked name, then the status padded out to a shared column."""
+    text = Text()
+    text.append(f"{row['badge']} ", style=row["badge_style"])
+    text.append(row["text"], style=link_style(row, browser, tui))
+    # pad outside the link so the underline stops at the name
+    text.append(" " * (label_width - len(row["text"])) + f"  {row['tail']}", style=row.get("tail_style", "dim"))
+    return text
+
+
+def site_grid_columns(up_rows, width, gap):
+    """
+    Lay the up sites out column-major (reading down, like ls) in as many
+    columns as fit width, each column only as wide as its own longest cell.
+    Returns the columns as lists of rows - one column when even two would
+    not fit, so a narrow terminal degrades to the plain list.
+    """
+    for count in range(len(up_rows), 1, -1):
+        per_column = math.ceil(len(up_rows) / count)
+        columns = [up_rows[index:index + per_column] for index in range(0, len(up_rows), per_column)]
+        widths = [max(len(row["text"]) for row in column) + max(len(row["tail"]) for row in column) + 4
+                  for column in columns]
+        if sum(widths) + gap * (len(columns) - 1) <= width:
+            return columns
+    return [up_rows] if up_rows else []
+
+
+class SiteGrid:
+    """
+    An http_checks panel body that adapts to the width it is drawn at: down
+    sites first, one per line at full width so a long curl error never
+    squeezes the grid, then the up sites in as many columns as fit. Rich
+    hands __rich_console__ the live width, so the TUI re-flows on resize and
+    --once fits the terminal it prints to.
+    """
+
+    GAP = 4
+
+    def __init__(self, rows, browser=None, tui=False):
+        self.rows = rows
+        self.browser = browser
+        self.tui = tui
+
+    def __rich_console__(self, console, options):
+        down = [row for row in self.rows if row["badge"] != "✓"]
+        up = [row for row in self.rows if row["badge"] == "✓"]
+        if down:
+            label_width = max(len(row["text"]) for row in down)
+            for row in down:
+                yield site_cell(row, label_width, self.browser, self.tui)
+        columns = site_grid_columns(up, options.max_width, self.GAP)
+        cells = []
+        for column in columns:
+            label_width = max(len(row["text"]) for row in column)
+            texts = [site_cell(row, label_width, self.browser, self.tui) for row in column]
+            cells.append((texts, max(text.cell_len for text in texts)))
+        for line_index in range(len(columns[0]) if columns else 0):
+            line = Text(no_wrap=len(columns) > 1, overflow="crop")
+            for column_index, (texts, column_width) in enumerate(cells):
+                if line_index >= len(texts):
+                    break
+                if column_index:
+                    line.append(" " * self.GAP)
+                line.append_text(texts[line_index])
+                if column_index < len(cells) - 1:
+                    line.append(" " * (column_width - texts[line_index].cell_len))
+            yield line
+
+    def __rich_measure__(self, console, options):
+        narrowest = max((site_cell(row, len(row["text"])).cell_len for row in self.rows), default=1)
+        return Measurement(min(narrowest, options.max_width), options.max_width)
+
+
 def result_renderable(result, browser=None, tui=False, log_link=None, panel_name=None):
     """
     Turn a PanelResult into a rich renderable (used by both the TUI and --once).
 
-    Link rows render differently per mode: --once emits plain OSC 8 hyperlinks
-    (the terminal handles clicks), but inside the TUI Textual captures the
-    mouse, so rows carry an @click action meta that routes through
-    app.action_open_link - which is also what honors the panel's browser.
-    A row's optional "tail" (an http_checks status column) stays on the same
-    line after the link; "meta" goes on its own indented line below.
+    Link rows are clickable both ways (see link_style); a row's "meta" goes
+    on its own indented line below. http_checks rows render as a SiteGrid.
     """
     if not result.ok:
         return Text(result.body, style="red")
+    if result.kind == "claude_usage":
+        return claude_usage_renderable(result.body)
+    if result.kind == "sites":
+        return SiteGrid(result.body, browser, tui)
     if result.kind == "ansi":
         if not result.body:
             return Text("(no output)", style="dim")
@@ -144,17 +323,7 @@ def result_renderable(result, browser=None, tui=False, log_link=None, panel_name
             text.append("\n")
         if row.get("badge"):
             text.append(f"{row['badge']} ", style=row.get("badge_style", ""))
-        dim = bool(row.get("dim"))
-        if tui:
-            style = Style(
-                bold=not dim, dim=dim, underline=True,
-                meta={"@click": f"app.open_link({row['url']!r}, {browser!r})"},
-            )
-        else:
-            style = Style(bold=not dim, dim=dim, link=row["url"])
-        text.append(row["text"], style=style)
-        if row.get("tail"):
-            text.append(f"  {row['tail']}", style=row.get("tail_style", "dim"))
+        text.append(row["text"], style=link_style(row, browser, tui))
         if row.get("meta"):
             text.append(f"\n    {row['meta']}", style="dim")
     return text

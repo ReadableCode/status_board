@@ -889,7 +889,7 @@ def test_site_label_defaults_to_host():
     assert statusboard_tools.site_label(SITES[1]) == "10.0.0.20:8000"
 
 
-def test_http_check_rows_alignment_and_summary():
+def test_http_check_rows_and_summary():
     checks = [
         {"code": 200, "seconds": 0.014, "error": None},
         {"code": 0, "seconds": 0.003, "error": "(7) Failed to connect"},
@@ -900,10 +900,7 @@ def test_http_check_rows_alignment_and_summary():
     assert [row["badge"] for row in rows] == ["✓", "✗", "✓"]
     assert rows[0]["text"] == "intranet" and rows[0]["url"] == SITES[0]["url"]
     assert rows[0]["tail"].endswith("200 · 14ms")
-    assert rows[1]["tail"].endswith("DOWN · (7) Failed to connect") and rows[1]["tail_style"] == "red"
-    # status column aligned: label + tail padding is constant across rows
-    widths = {len(row["text"]) + len(row["tail"]) - len(row["tail"].lstrip()) for row in rows}
-    assert len(widths) == 1
+    assert rows[1]["tail"] == "DOWN · (7) Failed to connect" and rows[1]["tail_style"] == "red"
     rows, summary, down = statusboard_tools.http_check_rows(SITES[:1], checks[:1])
     assert summary == "all 1 up" and down == 0
     # a wrong status code is down with the code shown
@@ -926,7 +923,7 @@ def test_fetch_http_checks_remote_runs_one_ssh_and_flags_alert(tmp_path, monkeyp
     assert calls[0][calls[0].index("-J") + 1] == "jdoe@10.0.0.10:2222"
     assert calls[0][-1] == statusboard_tools.http_checks_command(panel)
     assert result.ok and result.alert
-    assert result.kind == "links"
+    assert result.kind == "sites"
     assert result.summary == "2 up · 1 DOWN · from sshvm"
     assert [row["badge"] for row in result.body] == ["✓", "✗", "✓"]
 
@@ -1003,15 +1000,68 @@ def test_fetch_http_checks_missing_curl_is_an_error(tmp_path, monkeypatch):
     assert not result.ok and "curl not found" in result.body
 
 
-def test_result_renderable_tail_on_same_line():
+def site_row(name, up=True, tail="200 · 14ms"):
+    return {"badge": "✓" if up else "✗", "badge_style": "bold green" if up else "bold red", "text": name,
+            "url": f"https://{name}/", "tail": tail, "tail_style": "dim" if up else "red"}
+
+
+def render_plain(renderable, width):
+    from rich.console import Console
+
+    console = Console(width=width, color_system=None, force_terminal=False)
+    with console.capture() as capture:
+        console.print(renderable)
+    return [line.rstrip() for line in capture.get().splitlines()]
+
+
+def test_site_rows_keep_their_status_on_the_same_line():
     from src.status_board import result_renderable
 
-    rows = [{"badge": "✓", "badge_style": "bold green", "text": "intranet", "url": "https://x/",
-             "tail": "200 · 14ms", "tail_style": "dim"}]
-    plain = result_renderable(statusboard_tools.PanelResult(True, "links", rows, "all 1 up")).plain
-    assert plain == "✓ intranet  200 · 14ms"
-    plain = result_renderable(statusboard_tools.PanelResult(True, "links", rows), tui=True).plain
-    assert plain == "✓ intranet  200 · 14ms"
+    result = statusboard_tools.PanelResult(True, "sites", [site_row("intranet")], "all 1 up")
+    for tui in (False, True):
+        assert render_plain(result_renderable(result, tui=tui), 80) == ["✓ intranet  200 · 14ms"]
+
+
+def test_site_grid_fills_columns_downward_as_width_allows():
+    from src.status_board import SiteGrid
+
+    rows = [site_row(name) for name in ("alpha", "bravo", "charlie", "delta", "echo")]
+    # each cell is "✓ charlie  200 · 14ms" (21 wide) plus a 4-space gap
+    assert render_plain(SiteGrid(rows), 120) == [
+        "✓ alpha  200 · 14ms    ✓ bravo  200 · 14ms    ✓ charlie  200 · 14ms    ✓ delta  200 · 14ms    "
+        "✓ echo  200 · 14ms",
+    ]
+    assert render_plain(SiteGrid(rows), 70) == [
+        "✓ alpha  200 · 14ms    ✓ charlie  200 · 14ms    ✓ echo  200 · 14ms",
+        "✓ bravo  200 · 14ms    ✓ delta    200 · 14ms",
+    ]
+    assert render_plain(SiteGrid(rows), 50) == [
+        "✓ alpha    200 · 14ms    ✓ delta  200 · 14ms",
+        "✓ bravo    200 · 14ms    ✓ echo   200 · 14ms",
+        "✓ charlie  200 · 14ms",
+    ]
+    assert render_plain(SiteGrid(rows), 30) == [
+        "✓ alpha    200 · 14ms", "✓ bravo    200 · 14ms", "✓ charlie  200 · 14ms",
+        "✓ delta    200 · 14ms", "✓ echo     200 · 14ms",
+    ]
+
+
+def test_site_grid_puts_down_sites_first_at_full_width():
+    from src.status_board import SiteGrid
+
+    rows = [site_row("alpha"), site_row("bravo", up=False, tail="DOWN · (7) Failed to connect to bravo port 443"),
+            site_row("charlie")]
+    lines = render_plain(SiteGrid(rows), 80)
+    assert lines[0] == "✗ bravo  DOWN · (7) Failed to connect to bravo port 443"
+    assert lines[1] == "✓ alpha  200 · 14ms    ✓ charlie  200 · 14ms"
+
+
+def test_site_grid_never_runs_past_the_width():
+    from src.status_board import SiteGrid
+
+    rows = [site_row(f"site number {index}") for index in range(12)]
+    for width in (30, 45, 60, 90, 140):
+        assert all(len(line) <= width for line in render_plain(SiteGrid(rows), width))
 
 
 # %%

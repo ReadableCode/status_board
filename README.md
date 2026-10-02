@@ -3,8 +3,8 @@
 A long-lived [Textual](https://textual.textualize.io/) TUI that shows, in one
 pane: remote job/cron boards fetched over SSH (through jump hosts where
 needed), whether each of your sites is up (probed from wherever they are
-reachable), and PRs awaiting your review across multiple GitHub accounts
-(and Bitbucket). Panel definitions travel with the repos that own them — no
+reachable), how much Claude allowance each machine's login has left, and PRs
+awaiting your review across multiple GitHub accounts (and Bitbucket). Panel definitions travel with the repos that own them — no
 central registry to edit.
 
 ```bash
@@ -227,11 +227,17 @@ with any 2xx/3xx, or with one of its `expect` codes when that is set (e.g.
 `expect: 401` for an API that demands auth on its root). Rows render as
 
 ```
-✓ intranet       200 · 14ms
-✗ api health     DOWN · (7) Failed to connect to 10.0.0.20 port 8000 ...
+✗ api health  DOWN · (7) Failed to connect to 10.0.0.20 port 8000 ...
+✓ intranet     200 · 14ms     ✓ wiki     200 · 31ms
+✓ sso portal   302 · 88ms     ✓ grafana  302 · 40ms
 ```
 
-each site clickable (opens it in the panel's `browser:` if set), the panel
+down sites first, one per line at full width so a long curl error reads in
+full, then the up sites in as many columns as the panel's width fits
+(filled downward, like `ls`). The layout is worked out at draw time, so the
+TUI re-flows when the terminal is resized and a narrow terminal falls back
+to one site per line. Each site is clickable (opens it in the panel's
+`browser:` if set), the panel
 subtitle reads `all 3 up` or `2 up · 1 DOWN`, and any down site flags the
 panel red the way a fetch error would — while still showing every row, so
 the one that broke is obvious.
@@ -249,6 +255,54 @@ hop is skipped and curl runs locally — no shell involved, so a board on
 Windows works too. `timeout` (default 60s) bounds the ssh round trip when
 probing remotely. `insecure: true` skips certificate verification for a
 site with a self-signed or internal-CA cert.
+
+### `claude_usage` — Claude allowance left, for whatever the host is set up to use
+
+```yaml
+- name: acme_claude_usage
+  type: claude_usage
+  host: sshacmelaptop       # optional: the machine whose Claude Code to report
+  jump: sshacme             #   through this hop
+  interval: 300
+```
+
+Reports the connection the host's Claude Code is **configured** for, read
+from `~/.claude/settings.json` on that host, so switching a machine between
+a claude.ai login and AWS Bedrock shows up on the next poll with nothing to
+change here:
+
+```
+claude.ai max 20x · on homebox
+session      ▕░░░░░░░░░░░░░░░░░░░░░░▏   2% used · 98% left · resets 12:00 (in 4h 02m)
+weekly       ▕██████████░░░░░░░░░░░░▏  45% used · 55% left · resets Sat 04:00 (in 20h 02m)
+weekly Fable ▕█████████████████░░░░░▏  77% used · 23% left · resets Sat 04:00 (in 20h 02m)
+```
+
+- **claude.ai subscription** (Pro, Max, Team, Enterprise): one meter per
+  plan limit (the 5-hour session, the weekly allowance, and each
+  model-scoped weekly), with what is left and when it resets, plus usage
+  credits when they are switched on. The numbers come from the
+  account-metadata endpoint behind Claude Code's `/usage` screen, read with
+  the host's stored login (`~/.claude/.credentials.json`, or the login
+  keychain on macOS). No tokens are spent.
+- **Bedrock** (`CLAUDE_CODE_USE_BEDROCK` set): pay per token, so there is
+  no allowance and nothing resets. The panel shows the configured model and
+  region and that host's Claude Code token totals for today and the last 7
+  days, tallied from its transcripts under `~/.claude/projects`.
+
+The probe is read-only. It never refreshes the login, because refresh tokens
+rotate and a second refresher racing `claude` could strand the stored pair,
+and it never touches the settings. A login whose access token has lapsed
+reads as an error until `claude` next runs on that host (or something there
+that already refreshes it, like a cron poller). The panel subtitle shows the
+plan and its most-used limit, and the panel turns red when a limit is at
+100%.
+
+The probe is a stdlib-only script (`src/utils/claude_usage_probe.py`) piped
+to `python3 -` over the same ssh chain an `ssh_command` panel uses, so the
+host needs only `python3`. The login never leaves the host; only the
+numbers come back. With no `host`, or when the board runs on that host, the
+board's own interpreter runs it locally.
 
 ### `github_prs` — PRs awaiting your review, one panel per account
 

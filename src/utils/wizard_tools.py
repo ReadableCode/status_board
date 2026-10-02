@@ -254,6 +254,26 @@ def _prompt_http_checks_fields(panel, target, credentials_root, console):
         panel["max_time"] = max_time
 
 
+def _prompt_claude_usage_fields(panel, target, credentials_root, console):
+    from rich.prompt import IntPrompt
+
+    host = _prompt_host(
+        "host whose Claude Code to report (inventory name or alias; empty for the machine running the board)",
+        target["base_dir"], credentials_root, console, optional=True,
+    )
+    if host:
+        panel["host"] = host
+        jump = _prompt_host(
+            "jump hop (inventory name or alias, empty for none)",
+            target["base_dir"], credentials_root, console, optional=True,
+        )
+        if jump:
+            panel["jump"] = jump
+    timeout = IntPrompt.ask("probe timeout (seconds)", default=DEFAULT_SSH_TIMEOUT, console=console)
+    if timeout != DEFAULT_SSH_TIMEOUT:
+        panel["timeout"] = timeout
+
+
 def _prompt_env_file(panel, target, console):
     env_file = _ask_optional(
         f"env_file with the token(s), relative to {target['base_dir']} (empty to use real env vars only)", console
@@ -325,9 +345,10 @@ def run_wizard(credentials_root, repo_root=None):
         "github_prs": lambda: _prompt_github_fields(panel, target, console),
         "bitbucket_prs": lambda: _prompt_bitbucket_fields(panel, target, console),
         "http_checks": lambda: _prompt_http_checks_fields(panel, target, credentials_root, console),
+        "claude_usage": lambda: _prompt_claude_usage_fields(panel, target, credentials_root, console),
     }[panel_type]()
 
-    if panel_type != "ssh_command":
+    if panel_type not in ("ssh_command", "claude_usage"):
         browser = _ask_optional("browser for clicked links (edge/chrome/firefox/safari; empty for OS default)", console)
         if browser:
             panel["browser"] = browser

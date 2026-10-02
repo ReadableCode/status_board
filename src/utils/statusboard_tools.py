@@ -1,13 +1,15 @@
 # %%
 # Imports #
 
+import json
 import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 import yaml
@@ -35,10 +37,12 @@ from readable_utils.ssh_tools import (  # noqa: F401 - options/destination re-ex
 # %%
 # Variables #
 
-PANEL_TYPES = ("ssh_command", "github_prs", "bitbucket_prs", "http_checks")
+PANEL_TYPES = ("ssh_command", "github_prs", "bitbucket_prs", "http_checks", "claude_usage")
 
 # Per-type defaults: refresh interval (seconds) and, where relevant, timeouts
-DEFAULT_INTERVALS = {"ssh_command": 300, "github_prs": 180, "bitbucket_prs": 180, "http_checks": 120}
+DEFAULT_INTERVALS = {
+    "ssh_command": 300, "github_prs": 180, "bitbucket_prs": 180, "http_checks": 120, "claude_usage": 300,
+}
 DEFAULT_SSH_TIMEOUT = 60
 DEFAULT_HTTP_TIMEOUT = 30
 # http_checks: per-site curl --max-time (seconds), overridable per panel
@@ -49,6 +53,8 @@ DEFAULT_PROBE_TIMEOUT = 10
 SITE_MARKER = "==SITE=="
 HTTP_CHECK_MARKER = "==CHECK=="
 DEFAULT_GITHUB_API = "https://api.github.com"
+# claude_usage: the stdlib-only script piped to `python3 -` on the panel's host
+CLAUDE_USAGE_PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_usage_probe.py")
 BITBUCKET_API = "https://api.bitbucket.org/2.0"
 
 # The @@STATS@@ probe, its parser, and the ssh plumbing (base options, jump
@@ -67,9 +73,11 @@ class PanelResult:
     """
     Outcome of one panel fetch.
 
-    kind is "ansi" (body: raw terminal text to render as-is) or "links"
+    kind is "ansi" (body: raw terminal text to render as-is), "links"
     (body: list of {"text", "url", "meta"} rows the TUI turns into clickable
-    lines; an optional "tail" is appended dimmed on the same line). A failed
+    lines), "sites" (link rows with a "tail" status column, laid out in as
+    many columns as the panel width fits) or "claude_usage" (body: the
+    probe's report dict). A failed
     fetch has ok=False and the error text in body. stats is the parsed
     host-stats dict when the panel collects them (None otherwise, or when the
     remote failed to emit/parse them). alert marks a fetch that WORKED but
@@ -176,6 +184,7 @@ def _validate_panel(panel, config_path):
         "github_prs": ("token_env",),
         "bitbucket_prs": ("workspace", "username_env", "app_password_env"),
         "http_checks": ("sites",),
+        "claude_usage": (),
     }[panel["type"]]
     missing = [key for key in required if not panel.get(key)]
     if panel.get("host_stats"):
@@ -195,6 +204,8 @@ def _validate_panel(panel, config_path):
         _validate_log_link(panel, config_path)
     if panel["type"] == "http_checks":
         _validate_sites(panel, config_path)
+    if panel["type"] == "claude_usage" and panel.get("jump") and not panel.get("host"):
+        raise ValueError(f"Statusboard panel '{panel['name']}' in {config_path}: jump needs a host to hop to")
 
 
 def _validate_sites(panel, config_path):
@@ -475,15 +486,11 @@ def site_label(site):
 def http_check_rows(sites, checks):
     """
     Turn per-site probe results into link rows (click opens the site) and a
-    summary. Returns (rows, summary, down_count). Each row's ``tail`` pads
-    the status column into alignment - the row text itself is the link, so
-    padding there would underline blank space.
+    summary. Returns (rows, summary, down_count). The ``tail`` is the bare
+    status; the renderer pads it into alignment per grid column.
     """
-    labels = [site_label(site) for site in sites]
-    width = max(len(label) for label in labels)
     rows, down = [], 0
-    for site, check, label in zip(sites, checks, labels):
-        pad = " " * (width - len(label))
+    for site, check in zip(sites, checks):
         if site_is_up(site, check):
             badge, badge_style, tail_style = "✓", "bold green", "dim"
             status = f"{check['code']} · {check['seconds'] * 1000:.0f}ms"
@@ -495,9 +502,9 @@ def http_check_rows(sites, checks):
         rows.append({
             "badge": badge,
             "badge_style": badge_style,
-            "text": label,
+            "text": site_label(site),
             "url": str(site["url"]),
-            "tail": f"{pad}{status}",
+            "tail": status,
             "tail_style": tail_style,
             "dim": False,
         })
@@ -564,7 +571,166 @@ def fetch_http_checks(panel, credentials_root, local_hostname=""):
     rows, summary, down = http_check_rows(sites, checks)
     if panel.get("host"):
         summary += f" · from {panel['host']}"
-    return PanelResult(True, "links", rows, summary, alert=down > 0)
+    return PanelResult(True, "sites", rows, summary, alert=down > 0)
+
+
+def run_claude_usage_probe(panel, credentials_root, local_hostname=""):
+    """
+    Pipe the probe script to python3 on the panel's host over the usual ssh
+    chain (jump hop included) and parse the one JSON line it prints. With no
+    host, or when the chain resolves the host to THIS machine, the board's
+    own interpreter runs the probe - no shell, so a Windows board works too.
+    Returns (report, error), error None on success.
+    """
+    argv = None
+    if panel.get("host"):
+        argv = build_ssh_argv(panel, credentials_root, local_hostname, command="python3 -")
+    if argv is None or argv[0] != "ssh":
+        argv = [sys.executable, "-"]
+    with open(CLAUDE_USAGE_PROBE, "r", encoding="utf-8") as file_handle:
+        script = file_handle.read()
+    timeout = panel.get("timeout", DEFAULT_SSH_TIMEOUT)
+    try:
+        completed = subprocess.run(
+            argv, input=script, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"claude usage probe timed out after {timeout}s"
+    except FileNotFoundError:
+        return None, f"{argv[0]} not found on PATH"
+    lines = completed.stdout.strip().splitlines()
+    try:
+        return json.loads(lines[-1]), None
+    except (IndexError, ValueError):
+        return None, completed.stderr.strip() or completed.stdout.strip() or f"probe exited {completed.returncode}"
+
+
+def claude_usage_limits(usage):
+    """
+    The plan limits in a usage-endpoint response, as rows of
+    ``{"label", "percent", "resets_at", "severity"}`` (resets_at an aware
+    datetime or None). The response's ``limits`` array is authoritative - the
+    same rows the desktop app's Usage page draws: session, weekly_all and one
+    weekly_scoped row per model or surface with its own cap. The top-level
+    five_hour / seven_day dicts carry the same numbers and are only read when
+    a response has no limits array. Every other top-level key (the codenamed
+    ones) is a feature flag and ignored.
+    """
+    rows = []
+    for limit in usage.get("limits") or []:
+        kind = limit.get("kind") or limit.get("group") or "limit"
+        scope = limit.get("scope") or {}
+        if kind == "session":
+            label = "session"
+        elif kind == "weekly_all":
+            label = "weekly"
+        elif kind == "weekly_scoped":
+            label = f"weekly {(scope.get('model') or {}).get('display_name') or scope.get('surface') or 'scoped'}"
+        else:
+            label = kind.replace("_", " ")
+        rows.append({
+            "label": label,
+            "percent": float(limit.get("percent") or 0),
+            "resets_at": _parse_reset(limit.get("resets_at")),
+            "severity": limit.get("severity"),
+        })
+    if rows:
+        return rows
+    for key, label in (("five_hour", "session"), ("seven_day", "weekly")):
+        window = usage.get(key)
+        if isinstance(window, dict) and window.get("utilization") is not None:
+            rows.append({
+                "label": label,
+                "percent": float(window["utilization"]),
+                "resets_at": _parse_reset(window.get("resets_at")),
+                "severity": None,
+            })
+    return rows
+
+
+def claude_spend(usage):
+    """
+    The usage-credits row (``{"label", "percent", "used", "limit"}``, money
+    already formatted) when the account has credits switched on, else None.
+    UNVERIFIED beyond a disabled personal account: the amounts are read as
+    minor units scaled by their exponent, the way the disabled block reports
+    its zero.
+    """
+    spend = usage.get("spend") or {}
+    if not spend.get("enabled"):
+        return None
+
+    def money(amount):
+        if not isinstance(amount, dict) or amount.get("amount_minor") is None:
+            return None
+        value = amount["amount_minor"] / 10 ** int(amount.get("exponent") or 0)
+        return f"{value:,.2f} {amount.get('currency') or ''}".strip()
+
+    return {
+        "label": "credits",
+        "percent": float(spend.get("percent") or 0),
+        "used": money(spend.get("used")),
+        "limit": money(spend.get("limit")),
+    }
+
+
+def _parse_reset(value):
+    """resets_at arrives as ISO-8601 (maybe with a trailing Z) or epoch seconds; None when absent."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def compact_count(value):
+    """Token counts for the board: 874, 16.5k, 841k, 7.2M, 365M, 1.3B."""
+    for size, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if value >= size:
+            scaled = value / size
+            return f"{scaled:.1f}{suffix}" if scaled < 100 else f"{scaled:.0f}{suffix}"
+    return str(int(value))
+
+
+def claude_plan_label(report):
+    """claude.ai plan for the panel: the subscription, plus the rate-limit tier when it says more (max 20x)."""
+    plan = report.get("subscription") or "claude.ai"
+    tier = (report.get("tier") or "").replace("default_claude_", "")
+    if tier and tier != plan and tier.startswith(plan):
+        plan = tier.replace("_", " ")
+    return plan
+
+
+def fetch_claude_usage(panel, credentials_root, local_hostname=""):
+    """
+    Claude usage for whatever connection the host's Claude Code is configured
+    for (see claude_usage_probe.py): plan limits with what is left and when
+    each resets on a claude.ai subscription, or this host's token tally on
+    Bedrock, which has no allowance. The probe only reads - it never
+    refreshes a token - so a stale login shows as an error until claude next
+    runs there.
+    """
+    report, error = run_claude_usage_probe(panel, credentials_root, local_hostname)
+    if error:
+        return PanelResult.error(error)
+    if report.get("error"):
+        where = f" on {report['host']}" if report.get("host") else ""
+        plan = claude_plan_label(report) if report.get("mode") == "subscription" else report.get("mode")
+        return PanelResult.error(f"{plan}{where}: {report['error']}")
+    if report["mode"] == "bedrock":
+        today = report["tokens"]["today"]
+        summary = f"bedrock · {compact_count(today['output'])} out today"
+        return PanelResult(True, "claude_usage", report, summary)
+    limits = claude_usage_limits(report.get("usage") or {})
+    summary = claude_plan_label(report)
+    if limits:
+        top = max(limits, key=lambda row: row["percent"])
+        summary += f" · {top['label']} {top['percent']:.0f}% used"
+    return PanelResult(True, "claude_usage", report, summary, alert=any(row["percent"] >= 100 for row in limits))
 
 
 def fetch_github_prs(panel):
@@ -976,6 +1142,8 @@ def fetch_panel(panel, credentials_root, local_hostname=""):
             return fetch_github_prs(panel)
         if panel["type"] == "http_checks":
             return fetch_http_checks(panel, credentials_root, local_hostname)
+        if panel["type"] == "claude_usage":
+            return fetch_claude_usage(panel, credentials_root, local_hostname)
         return fetch_bitbucket_prs(panel)
     except Exception as error:  # noqa: BLE001 - a panel must never take the board down
         return PanelResult.error(f"{type(error).__name__}: {error}")
