@@ -9,6 +9,14 @@ import subprocess
 import pytest
 import yaml
 from utils import statusboard_tools
+from utils.statusboard_tools import (
+    GROUP_MINE,
+    GROUP_OTHERS,
+    SUB_DRAFTS,
+    SUB_NOT_READY,
+    SUB_OPEN,
+    SUB_READY,
+)
 
 # %%
 # Helpers #
@@ -475,13 +483,20 @@ def test_classify_github_prs_buckets_and_order():
     )
     assert [(r["badge"], r["url"]) for r in rows] == [
         ("●", fresh["html_url"]),
+        ("💬", soft["html_url"]),
         ("✋", blocked["html_url"]),
         ("✋", reviewed_cr["html_url"]),
-        ("💬", soft["html_url"]),
         ("⬆", my_open["html_url"]),
     ]
-    assert summary == "1 to review · 2 on author · 1 yours"
+    assert summary == "2 ready · 2 not ready · 1 yours"
     assert "your PR · ✓ approved" in rows[-1]["meta"]
+    assert [(r["group"], r["subgroup"]) for r in rows] == [
+        (GROUP_OTHERS, SUB_READY),
+        (GROUP_OTHERS, SUB_READY),
+        (GROUP_OTHERS, SUB_NOT_READY),
+        (GROUP_OTHERS, SUB_NOT_READY),
+        (GROUP_MINE, SUB_OPEN),
+    ]
 
 
 def test_classify_github_prs_own_pr_verdicts():
@@ -500,7 +515,7 @@ def test_classify_github_prs_dedups_requested_and_reviewed():
     pr = gh_item("acme/app", 8)
     rows, summary = statusboard_tools.classify_github_prs("me", [pr], [pr], [], {})
     assert len(rows) == 1
-    assert summary == "1 to review · 0 on author · 0 yours"
+    assert summary == "1 ready · 0 not ready · 0 yours"
 
 
 # %%
@@ -511,22 +526,59 @@ def test_classify_github_prs_flags_unsubmitted_draft_first():
     states = {draft["html_url"]: {"me": "PENDING"}}
     rows, summary = statusboard_tools.classify_github_prs("me", [fresh, draft], [], [], states)
     assert [(r["badge"], r["url"]) for r in rows] == [("✏", draft["html_url"]), ("●", fresh["html_url"])]
-    assert summary.startswith("1 UNSUBMITTED · 1 to review")
+    assert summary.startswith("1 UNSUBMITTED · 2 ready")
     assert "author can't see it" in rows[0]["meta"]
 
 
-def test_classify_github_prs_parks_all_drafts_last():
+def test_classify_github_prs_groups_drafts():
     my_draft = dict(gh_item("acme/app", 11, author="me"), draft=True)
     their_draft = dict(gh_item("acme/app", 12), draft=True)  # even with my review requested
     fresh = gh_item("acme/app", 13)
     rows, summary = statusboard_tools.classify_github_prs("me", [their_draft, fresh], [], [my_draft], {})
-    assert [(r["badge"], r["url"]) for r in rows] == [
-        ("●", fresh["html_url"]),
-        ("◌", their_draft["html_url"]),
-        ("◌", my_draft["html_url"]),
+    assert [(r["badge"], r["url"], r["subgroup"]) for r in rows] == [
+        ("●", fresh["html_url"], SUB_READY),
+        ("◌", their_draft["html_url"], SUB_NOT_READY),   # someone else's draft: not ready
+        ("◌", my_draft["html_url"], SUB_DRAFTS),         # mine: my PRs / drafts
     ]
     assert all(r["dim"] for r in rows if r["badge"] == "◌")
-    assert summary == "1 to review · 0 on author · 0 yours · 2 parked"
+    assert rows[1]["meta"].endswith("· draft") and rows[2]["meta"].endswith("· your draft")
+    assert summary == "1 ready · 1 not ready · 0 yours · 1 drafts"
+
+
+def test_classify_github_prs_red_checks_move_to_not_ready():
+    red = gh_item("acme/app", 30)
+    green = gh_item("acme/app", 31)
+    running = gh_item("acme/app", 32)
+    commented_red = gh_item("acme/app", 33)
+    my_red = gh_item("acme/app", 34, author="me")
+    unsubmitted_red = gh_item("acme/app", 35)
+    checks = {
+        red["html_url"]: checks_of({"ruff": "fail", "pytest": "pass"}),
+        green["html_url"]: checks_of({"ruff": "pass", "pytest": "pass"}),
+        running["html_url"]: checks_of({"ruff": "pass", "pytest": "pending"}),   # pending is not red
+        commented_red["html_url"]: checks_of({"SonarQube Code Analysis": "fail"}),
+        my_red["html_url"]: checks_of({"docker-build": "fail"}),
+        unsubmitted_red["html_url"]: checks_of({"ruff": "fail"}),
+    }
+    states = {commented_red["html_url"]: {"me": "COMMENTED"}, unsubmitted_red["html_url"]: {"me": "PENDING"}}
+    rows, summary = statusboard_tools.classify_github_prs(
+        "me", [red, green, running, unsubmitted_red], [commented_red], [my_red], states, checks=checks
+    )
+    assert [(r["badge"], r["url"], r["subgroup"]) for r in rows] == [
+        ("✏", unsubmitted_red["html_url"], SUB_READY),   # my unsubmitted review needs me whatever CI says
+        ("●", green["html_url"], SUB_READY),
+        ("●", running["html_url"], SUB_READY),
+        ("●", red["html_url"], SUB_NOT_READY),
+        ("💬", commented_red["html_url"], SUB_NOT_READY),
+        ("⬆", my_red["html_url"], SUB_OPEN),             # my own red PR stays in my PRs / open
+    ]
+    assert summary == "1 UNSUBMITTED · 3 ready · 2 not ready · 1 yours"
+    assert rows[3]["checks"]["red"] == ["ruff"]
+    assert rows[5]["checks"]["red"] == ["docker-build"]
+
+
+def checks_of(buckets):
+    return statusboard_tools.summarize_checks([{"name": n, "bucket": b} for n, b in buckets.items()])
 
 
 def test_classify_github_prs_rerequest_returns_to_needs_review():
@@ -539,7 +591,7 @@ def test_classify_github_prs_rerequest_returns_to_needs_review():
     rows, summary = statusboard_tools.classify_github_prs("me", [pr], [], [], states, {pr["html_url"]})
     assert rows[0]["badge"] == "●"
     assert "re-requested after your changes" in rows[0]["meta"]
-    assert summary == "1 to review · 0 on author · 0 yours"
+    assert summary == "1 ready · 0 not ready · 0 yours"
 
 
 def test_classify_github_prs_pushed_since_returns_to_needs_review():
@@ -551,7 +603,7 @@ def test_classify_github_prs_pushed_since_returns_to_needs_review():
     )
     assert rows[0]["badge"] == "●"
     assert "updated since your changes" in rows[0]["meta"]
-    assert summary == "1 to review · 0 on author · 0 yours"
+    assert summary == "1 ready · 0 not ready · 0 yours"
     # an explicit re-request wins over the pushed-since signal
     rows, _ = statusboard_tools.classify_github_prs(
         "me", [pr], [], [], states, {pr["html_url"]}, {pr["html_url"]}
@@ -643,6 +695,15 @@ def test_fetch_github_prs_renders_through_a_user_outage(monkeypatch):
             return FakeGithubResponse(200, {"items": [mine] if author_query else []})
         if url.endswith("/reviews"):
             return FakeGithubResponse(200, [{"user": {"login": "bob"}, "state": "APPROVED", "commit_id": "a1"}])
+        if url.endswith("/pulls/21"):
+            return FakeGithubResponse(200, {"head": {"sha": "a1"}, "requested_reviewers": []})
+        if url.endswith("/commits/a1/check-runs"):
+            return FakeGithubResponse(200, {"check_runs": [
+                {"name": "ruff", "status": "completed", "conclusion": "success"},
+                {"name": "pytest", "status": "in_progress", "conclusion": None},
+            ]})
+        if url.endswith("/commits/a1/status"):
+            return FakeGithubResponse(200, {"statuses": [{"context": "SonarQube Code Analysis", "state": "failure"}]})
         if url.endswith("/user/orgs"):
             return FakeGithubResponse(200, [])
         raise AssertionError(f"unexpected GET {url}")
@@ -657,6 +718,84 @@ def test_fetch_github_prs_renders_through_a_user_outage(monkeypatch):
     assert result.ok
     assert [row["url"] for row in result.body] == [mine["html_url"]]
     assert result.summary.endswith("(me)")
+    checks = result.body[0]["checks"]
+    assert checks["slots"] == [("lint", "pass"), ("tests", "pending"), ("sonar", "fail")]
+    assert checks["red"] == ["SonarQube Code Analysis"] and not checks["hidden"]
+
+
+def test_github_checks_hidden_when_check_runs_403(monkeypatch):
+    def fake_get(url, **kwargs):
+        if url.endswith("/check-runs"):
+            return FakeGithubResponse(403)
+        if url.endswith("/status"):
+            return FakeGithubResponse(200, {"statuses": []})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(statusboard_tools.requests, "get", fake_get)
+    checks = statusboard_tools._github_checks("https://api", {}, "acme/app", "a1")
+    assert checks["hidden"] and all(state == "hidden" for _, state in checks["slots"])
+
+
+def test_check_slot_sorts_names_into_columns():
+    assert statusboard_tools.check_slot("SonarQube Code Analysis") == "sonar"
+    assert statusboard_tools.check_slot("Quality Gate") == "sonar"
+    assert statusboard_tools.check_slot("ruff") == "lint"
+    assert statusboard_tools.check_slot("tflint") == "lint"
+    assert statusboard_tools.check_slot("lint and test") == "lint"   # lint wins a combined job
+    assert statusboard_tools.check_slot("pytest (3.12)") == "tests"
+    assert statusboard_tools.check_slot("docker-build") is None
+
+
+def test_summarize_checks_worst_state_per_slot_and_red_list():
+    entries = [
+        {"name": "ruff", "bucket": "pass"},
+        {"name": "isort", "bucket": "fail"},
+        {"name": "pytest", "bucket": "pending"},
+        {"name": "docker-build", "bucket": "fail"},     # no column, still red
+        {"name": "deploy", "bucket": "skip"},           # skipped/cancelled: ignored entirely
+    ]
+    checks = statusboard_tools.summarize_checks(entries)
+    assert checks["slots"] == [("lint", "fail"), ("tests", "pending"), ("sonar", "none")]
+    assert checks["red"] == ["isort", "docker-build"]
+    assert checks["ignored"] == [] and not checks["hidden"]
+
+
+def test_summarize_checks_ignore_rules_by_repo_and_name():
+    entries = [{"name": "SonarQube Code Analysis", "bucket": "fail"}, {"name": "ruff", "bucket": "pass"}]
+    rules = [{"repo": "airflow", "name": "sonar"}]
+    waved = statusboard_tools.summarize_checks(entries, "acme/airflow-dags", rules)
+    assert waved["slots"][-1] == ("sonar", "ignored")
+    assert waved["red"] == [] and waved["ignored"] == ["SonarQube Code Analysis"]
+    other = statusboard_tools.summarize_checks(entries, "acme/app", rules)
+    assert other["slots"][-1] == ("sonar", "fail") and other["red"] == ["SonarQube Code Analysis"]
+    anywhere = statusboard_tools.summarize_checks(entries, "acme/app", [{"name": "sonar"}])
+    assert anywhere["red"] == []
+    # a waved failure outranks a passing sibling in the same column
+    two = entries + [{"name": "SonarQube Quality Gate", "bucket": "pass"}]
+    assert statusboard_tools.summarize_checks(two, "acme/app", [{"name": "sonar"}])["slots"][-1] == ("sonar", "ignored")
+
+
+@pytest.mark.parametrize(
+    "panel, match",
+    [
+        ({"name": "x", "type": "github_prs", "token_env": "T", "ignore_checks": "sonar"}, "non-empty list"),
+        ({"name": "x", "type": "github_prs", "token_env": "T", "ignore_checks": []}, "non-empty list"),
+        ({"name": "x", "type": "github_prs", "token_env": "T", "ignore_checks": [{"repo": "a"}]}, "needs a name"),
+        ({"name": "x", "type": "ssh_command", "host": "h", "command": "c", "ignore_checks": [{"name": "s"}]},
+         "only supported on github_prs and bitbucket_prs"),
+    ],
+)
+def test_ignore_checks_validation(tmp_path, panel, match):
+    (tmp_path / "statusboard.yaml").write_text(yaml.safe_dump([panel]))
+    with pytest.raises(ValueError, match=match):
+        statusboard_tools.load_panels(tmp_path, tmp_path)
+
+
+def test_ignore_checks_valid_loads(tmp_path):
+    panel = {"name": "x", "type": "github_prs", "token_env": "T", "ignore_checks": [{"repo": "a", "name": "sonar"}]}
+    (tmp_path / "statusboard.yaml").write_text(yaml.safe_dump([panel]))
+    panels, _ = statusboard_tools.load_panels(tmp_path, tmp_path)
+    assert panels[0]["ignore_checks"] == [{"repo": "a", "name": "sonar"}]
 
 
 # %%
@@ -691,9 +830,10 @@ def test_classify_bitbucket_prs_buckets_and_order():
         ("✋", blocked["links"]["html"]["href"]),
         ("⬆", my_open["links"]["html"]["href"]),
     ]
-    assert summary == "1 to review · 1 on author · 1 yours"
+    assert summary == "1 ready · 1 not ready · 1 yours"
     assert "your PR · ✓ approved" in rows[-1]["meta"]
     assert rows[0]["text"] == "repo#1  PR 1"
+    assert [r["subgroup"] for r in rows] == [SUB_READY, SUB_NOT_READY, SUB_OPEN]
 
 
 def test_classify_bitbucket_prs_own_pr_verdicts():
@@ -711,7 +851,7 @@ def test_classify_bitbucket_prs_own_pr_verdicts():
         assert verdict in rows[0]["meta"]
 
 
-def test_classify_bitbucket_prs_parks_all_drafts_last():
+def test_classify_bitbucket_prs_groups_drafts():
     me = "{me}"
     my_draft = bb_pr(6, author_uuid=me, draft=True)
     their_draft = bb_pr(7, draft=True)
@@ -719,13 +859,30 @@ def test_classify_bitbucket_prs_parks_all_drafts_last():
     rows, summary = statusboard_tools.classify_bitbucket_prs(
         me, [("repo", my_draft), ("repo", their_draft), ("repo", fresh)]
     )
-    assert [(r["badge"], r["url"]) for r in rows] == [
-        ("●", fresh["links"]["html"]["href"]),
-        ("◌", my_draft["links"]["html"]["href"]),
-        ("◌", their_draft["links"]["html"]["href"]),
+    assert [(r["badge"], r["url"], r["subgroup"]) for r in rows] == [
+        ("●", fresh["links"]["html"]["href"], SUB_READY),
+        ("◌", their_draft["links"]["html"]["href"], SUB_NOT_READY),
+        ("◌", my_draft["links"]["html"]["href"], SUB_DRAFTS),
     ]
     assert all(r["dim"] for r in rows if r["badge"] == "◌")
-    assert summary == "1 to review · 0 on author · 0 yours · 2 parked"
+    assert summary == "1 ready · 1 not ready · 0 yours · 1 drafts"
+
+
+def test_classify_bitbucket_prs_red_checks_move_to_not_ready():
+    me = "{me}"
+    red, green = bb_pr(20), bb_pr(21)
+    checks = {
+        red["links"]["html"]["href"]: checks_of({"Pipeline #7": "fail"}),
+        green["links"]["html"]["href"]: checks_of({"Pipeline #8": "pass"}),
+    }
+    rows, summary = statusboard_tools.classify_bitbucket_prs(me, [("repo", red), ("repo", green)], checks)
+    assert [(r["url"], r["subgroup"]) for r in rows] == [
+        (green["links"]["html"]["href"], SUB_READY),
+        (red["links"]["html"]["href"], SUB_NOT_READY),
+    ]
+    assert rows[1]["checks"]["red"] == ["Pipeline #7"]
+    assert rows[1]["checks"]["slots"] == [("lint", "none"), ("tests", "none"), ("sonar", "none")]
+    assert summary == "1 ready · 1 not ready · 0 yours"
 
 
 def test_bitbucket_involves_author_or_reviewer():
@@ -776,7 +933,45 @@ def test_fetch_bitbucket_prs_filters_client_side_no_uuid_query(monkeypatch):
     assert list_params["state"] == "OPEN"
     assert "reviewers" in list_params["fields"] and "participants" in list_params["fields"]
     assert [row["badge"] for row in result.body] == ["●", "⬆"]  # PR 11 excluded
-    assert result.summary == "1 to review · 0 on author · 1 yours (ws)"
+    assert result.summary == "1 ready · 0 not ready · 1 yours (ws)"
+
+
+def test_fetch_bitbucket_prs_reads_head_commit_statuses(monkeypatch):
+    me = "{me}"
+    pr = bb_pr(12, author_uuid="{alice}", reviewers=[{"uuid": me}], source={"commit": {"hash": "abc"}})
+    statuses_url = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/user"):
+            return FakeResponse({"uuid": me})
+        if "/commit/abc/statuses" in url:
+            statuses_url.append(url)
+            return FakeResponse({"values": [
+                {"name": "Pipeline #3", "state": "FAILED"},
+                {"key": "sonar", "name": "SonarQube Code Analysis", "state": "SUCCESSFUL"},
+            ]})
+        return FakeResponse({"values": [pr]})
+
+    monkeypatch.setattr(statusboard_tools.requests, "get", fake_get)
+    monkeypatch.setattr(statusboard_tools, "resolve_secret", lambda panel, key: "x")
+    result = statusboard_tools.fetch_bitbucket_prs(
+        {"name": "bb", "type": "bitbucket_prs", "workspace": "ws", "repos": ["repo"],
+         "username_env": "U", "app_password_env": "P"}
+    )
+    assert statuses_url == ["https://api.bitbucket.org/2.0/repositories/ws/repo/commit/abc/statuses?pagelen=100"]
+    row = result.body[0]
+    assert row["subgroup"] == SUB_NOT_READY
+    assert row["checks"]["red"] == ["Pipeline #3"]
+    assert row["checks"]["slots"][-1] == ("sonar", "pass")
 
 
 # %%

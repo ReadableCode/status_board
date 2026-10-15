@@ -90,8 +90,22 @@ def open_link(url, browser=None):
 # readable_utils.host_stats_tools, shared with herdstone)
 
 
+# How each PR check column state is drawn: the mark and its style.
+CHECK_MARKS = {
+    "pass": ("✓", "bold green"),
+    "fail": ("✗", "bold red"),
+    "pending": ("⧗", "yellow"),
+    "none": ("–", "dim"),
+    "hidden": ("?", "dim"),
+    "ignored": ("ignored", "dim"),
+}
+
+
 def legend_text():
-    """One-line key for the PR badge symbols, shown at the bottom of the board."""
+    """
+    Two-line key at the bottom of the board: the PR state badges, then the
+    check-column marks (shared with the site up/down marks).
+    """
     text = Text()
     for index, (badge, style, label) in enumerate([
         ("✏", "bold red", "unsubmitted draft"),
@@ -99,14 +113,58 @@ def legend_text():
         ("✋", "bold yellow", "waiting on author"),
         ("💬", "dim", "you commented"),
         ("⬆", "bold magenta", "your PR"),
-        ("◌", "dim", "draft, parked"),
-        ("✓", "bold green", "site up"),
-        ("✗", "bold red", "site down"),
+        ("◌", "dim", "draft"),
     ]):
         if index:
             text.append("   ", style="dim")
         text.append(badge, style=style)
         text.append(f" {label}", style="dim")
+    text.append("\nchecks ", style="dim")
+    for index, (state, label) in enumerate([
+        ("pass", "passed"),
+        ("fail", "failed"),
+        ("pending", "running"),
+        ("none", "repo has no such check"),
+        ("hidden", "hidden from token"),
+    ]):
+        if index:
+            text.append("   ", style="dim")
+        mark, style = CHECK_MARKS[state]
+        text.append(mark, style=style)
+        text.append(f" {label}", style="dim")
+    text.append("     sites ", style="dim")
+    text.append("✓", style="bold green")
+    text.append(" up   ", style="dim")
+    text.append("✗", style="bold red")
+    text.append(" down", style="dim")
+    return text
+
+
+def checks_text(checks):
+    """
+    The check columns of one PR row: "lint ✓  tests ✓  sonar ✗", the same
+    three fixed-width columns on every row so they line up down the panel,
+    then the names behind a red or ignored column (or the hidden-token note).
+    """
+    text = Text()
+    for index, (slot, state) in enumerate(checks["slots"]):
+        if index:
+            text.append("  ")
+        text.append(f"{slot} ", style="dim")
+        mark, style = CHECK_MARKS[state]
+        text.append(mark, style=style)
+    return text
+
+
+def checks_tail(checks):
+    """What follows a row's meta when its checks have something to say."""
+    text = Text()
+    if checks["red"]:
+        text.append(f" · red: {', '.join(checks['red'])}", style="red")
+    if checks["ignored"]:
+        text.append(f" · ignored: {', '.join(checks['ignored'])}", style="dim")
+    if checks["hidden"]:
+        text.append(" · checks not visible to token", style="dim")
     return text
 
 
@@ -300,7 +358,10 @@ def result_renderable(result, browser=None, tui=False, log_link=None, panel_name
     Turn a PanelResult into a rich renderable (used by both the TUI and --once).
 
     Link rows are clickable both ways (see link_style); a row's "meta" goes
-    on its own indented line below. http_checks rows render as a SiteGrid.
+    on its own indented line below, after its check columns when it has
+    them. Rows carrying a group/subgroup are indented under those headers,
+    emitted whenever they change (rows arrive already ordered by group).
+    http_checks rows render as a SiteGrid.
     """
     if not result.ok:
         return Text(result.body, style="red")
@@ -318,14 +379,36 @@ def result_renderable(result, browser=None, tui=False, log_link=None, panel_name
     if not result.body:
         return Text("nothing awaiting review 🎉", style="green")
     text = Text()
+    group = subgroup = None
     for index, row in enumerate(result.body):
         if index:
             text.append("\n")
-        if row.get("badge"):
-            text.append(f"{row['badge']} ", style=row.get("badge_style", ""))
-        text.append(row["text"], style=link_style(row, browser, tui))
-        if row.get("meta"):
-            text.append(f"\n    {row['meta']}", style="dim")
+        if row.get("group"):
+            if row["group"] != group:
+                group, subgroup = row["group"], None
+                text.append(f"{group}\n", style="bold")
+            if row.get("subgroup") != subgroup:
+                subgroup = row["subgroup"]
+                text.append(f"  {subgroup}\n", style="italic")
+        text.append_text(link_row(row, "    " if group else "", browser, tui))
+    return text
+
+
+def link_row(row, indent, browser=None, tui=False):
+    """One link row: badge + linked text, then the check columns and meta on the line below."""
+    text = Text()
+    if row.get("badge"):
+        text.append(f"{indent}{row['badge']} ", style=row.get("badge_style", ""))
+    text.append(row["text"], style=link_style(row, browser, tui))
+    if row.get("checks") or row.get("meta"):
+        text.append(f"\n{indent}    ")
+    if row.get("checks"):
+        text.append_text(checks_text(row["checks"]))
+        text.append("   ")
+    if row.get("meta"):
+        text.append(row["meta"], style="dim")
+    if row.get("checks"):
+        text.append_text(checks_tail(row["checks"]))
     return text
 
 
@@ -573,7 +656,7 @@ def build_app(panels, local_hostname):
         .panel-footer ProgressBar { width: 1fr; }
         .panel-footer Bar { width: 1fr; }
         .panel-countdown { color: $text-muted; margin-left: 2; }
-        .legend { height: 1; padding: 0 2; }
+        .legend { height: 2; padding: 0 2; }
         LogTailScreen RichLog {
             border: round $primary;
             border-title-color: $accent;

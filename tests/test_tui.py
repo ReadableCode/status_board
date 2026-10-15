@@ -28,6 +28,60 @@ def fake_fetch_factory(calls):
 
 
 # %%
+# PR rows: group headers, check columns, key #
+
+
+def test_pr_rows_render_under_group_headers_with_check_columns():
+    from src import status_board
+    from utils.statusboard_tools import (
+        GROUP_MINE,
+        GROUP_OTHERS,
+        SUB_NOT_READY,
+        SUB_OPEN,
+        SUB_READY,
+        summarize_checks,
+    )
+
+    def row(badge, text, group, subgroup, checks):
+        return {"badge": badge, "badge_style": "bold cyan", "text": text, "url": f"https://x/{text}",
+                "meta": "by alice · updated 2h ago", "checks": checks, "group": group, "subgroup": subgroup,
+                "dim": False}
+
+    rows = [
+        row("●", "app#1", GROUP_OTHERS, SUB_READY,
+            summarize_checks([{"name": "ruff", "bucket": "pass"}, {"name": "pytest", "bucket": "pending"}])),
+        row("●", "app#2", GROUP_OTHERS, SUB_NOT_READY,
+            summarize_checks([{"name": "ruff", "bucket": "fail"}, {"name": "docker-build", "bucket": "fail"}])),
+        row("⬆", "app#3", GROUP_MINE, SUB_OPEN,
+            summarize_checks([{"name": "SonarQube Code Analysis", "bucket": "fail"}], "app", [{"name": "sonar"}])),
+    ]
+    text = status_board.result_renderable(PanelResult(True, "links", rows, "1 ready · 1 not ready · 1 yours")).plain
+    assert text.splitlines() == [
+        "others' PRs",
+        "  ready for review",
+        "    ● app#1",
+        "        lint ✓  tests ⧗  sonar –   by alice · updated 2h ago",
+        "  not ready",
+        "    ● app#2",
+        "        lint ✗  tests –  sonar –   by alice · updated 2h ago · red: ruff, docker-build",
+        "my PRs",
+        "  open",
+        "    ⬆ app#3",
+        "        lint –  tests –  sonar ignored   by alice · updated 2h ago · ignored: SonarQube Code Analysis",
+    ]
+
+
+def test_legend_names_every_check_mark():
+    from src import status_board
+
+    legend = status_board.legend_text().plain
+    first, second = legend.splitlines()
+    assert "● needs your review" in first and "◌ draft" in first
+    for mark in ("✓ passed", "✗ failed", "⧗ running", "– repo has no such check", "? hidden from token", "sites ✓ up"):
+        assert mark in second
+
+
+# %%
 # Single-pane vs all-pane refresh #
 
 

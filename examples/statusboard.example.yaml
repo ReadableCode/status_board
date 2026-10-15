@@ -37,6 +37,12 @@
   env_file: example.env      # optional, relative to this config's repo root
   browser: chrome            # optional: open clicked PRs in this browser
   interval: 180
+  # optional: failed checks to show as "ignored" instead of red (name is a
+  # case-insensitive substring of the check name, repo of the repo name; omit
+  # repo to match every repo) - for a quality gate a repo merges red anyway
+  # ignore_checks:
+  #   - repo: some-repo
+  #     name: SonarQube
 
 # --- http_checks: is each site up? one curl GET per site -------------------
 - name: acme_sites

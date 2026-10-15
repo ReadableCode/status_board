@@ -57,6 +57,26 @@ DEFAULT_GITHUB_API = "https://api.github.com"
 CLAUDE_USAGE_PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "claude_usage_probe.py")
 BITBUCKET_API = "https://api.bitbucket.org/2.0"
 
+# PR check columns, in display order. Every check run / commit status on a
+# PR's head commit is sorted by name (case-insensitive substring) into one of
+# these columns so the board shows "lint ✓  tests ✓  sonar ✗" with the same
+# three columns on every row, whatever each repo happens to run. Matching
+# runs in CHECK_MATCH_ORDER: sonar first so "SonarQube Code Analysis" never
+# lands in tests, then lint before tests so a combined "lint and test" job
+# counts as lint. Checks that match no slot still count: a failing one is
+# named in the row's "red:" list, so a red docker build is never hidden just
+# because it has no column.
+CHECK_SLOTS = (
+    ("lint", ("lint", "ruff", "isort", "black", "flake8", "pre-commit", "mypy", "eslint", "prettier", "format")),
+    ("tests", ("test", "pytest", "unit", "integration")),
+    ("sonar", ("sonar", "quality gate")),
+)
+CHECK_MATCH_ORDER = ("sonar", "lint", "tests")
+# Row grouping for the PR panels: a PR is either someone else's (and ready
+# for my review or not) or mine (open or still a draft).
+GROUP_OTHERS, GROUP_MINE = "others' PRs", "my PRs"
+SUB_READY, SUB_NOT_READY, SUB_OPEN, SUB_DRAFTS = "ready for review", "not ready", "open", "drafts"
+
 # The @@STATS@@ probe, its parser, and the ssh plumbing (base options, jump
 # hops, identity files, the run-locally short-circuit) live in readable_utils
 # so herdstone and this board can't drift apart - this module only keeps the
@@ -204,8 +224,30 @@ def _validate_panel(panel, config_path):
         _validate_log_link(panel, config_path)
     if panel["type"] == "http_checks":
         _validate_sites(panel, config_path)
+    if panel.get("ignore_checks") is not None:
+        _validate_ignore_checks(panel, config_path)
     if panel["type"] == "claude_usage" and panel.get("jump") and not panel.get("host"):
         raise ValueError(f"Statusboard panel '{panel['name']}' in {config_path}: jump needs a host to hop to")
+
+
+def _validate_ignore_checks(panel, config_path):
+    """
+    ``ignore_checks`` is a non-empty list of ``{name, repo?}`` rules on a PR
+    panel: a failed check whose name contains ``name`` (case-insensitive) in
+    a repo whose name contains ``repo`` (any repo when omitted) is shown as
+    "ignored" instead of red, and does not make the PR "not ready". For the
+    one repo whose quality gate is known to fail on every PR and is merged
+    red anyway - the board must agree with the review workflow on that.
+    """
+    prefix = f"Statusboard panel '{panel['name']}' in {config_path}"
+    if panel["type"] not in ("github_prs", "bitbucket_prs"):
+        raise ValueError(f"{prefix}: ignore_checks is only supported on github_prs and bitbucket_prs panels")
+    rules = panel["ignore_checks"]
+    if not isinstance(rules, list) or not rules:
+        raise ValueError(f"{prefix}: ignore_checks must be a non-empty list of {{name, repo}} mappings")
+    for rule in rules:
+        if not isinstance(rule, dict) or not rule.get("name"):
+            raise ValueError(f"{prefix}: every ignore_checks rule needs a name (check-name substring): {rule}")
 
 
 def _validate_sites(panel, config_path):
@@ -776,20 +818,21 @@ def fetch_github_prs(panel):
         states, commits = _pr_review_states(api, headers, item)
         review_states[item["html_url"]] = states
         review_commits[item["html_url"]] = commits
-    # Two signals unstick a changes-requested PR, probed with one PR-detail
-    # call each (only for that subset, to keep the extra API calls rare):
-    # appearing in requested_reviewers again means the author explicitly
-    # re-requested me (submitting a review clears me from that list, and a
-    # team request matches the search but not the list); a head sha that
-    # moved past the sha my review was submitted against means the author
-    # pushed since - GitHub keeps my blocking review active across pushes,
-    # so without this the PR would sit at "you requested changes" forever.
-    rerequested, updated_since = set(), set()
+    # One PR-detail call per PR: the search items carry no head sha, and the
+    # sha is what the checks (check runs + legacy commit statuses) hang off.
+    # The same detail answers the two signals that unstick a
+    # changes-requested PR: appearing in requested_reviewers again means the
+    # author explicitly re-requested me (submitting a review clears me from
+    # that list, and a team request matches the search but not the list); a
+    # head sha that moved past the sha my review was submitted against means
+    # the author pushed since - GitHub keeps my blocking review active across
+    # pushes, so without this the PR would sit at "you requested changes"
+    # forever.
+    rerequested, updated_since, checks = set(), set(), {}
     requested_urls = {i["html_url"] for i in requested}
-    for item in {i["html_url"]: i for i in requested + reviewed}.values():
+    ignore = panel.get("ignore_checks") or []
+    for item in {i["html_url"]: i for i in requested + reviewed + mine}.values():
         url = item["html_url"]
-        if review_states.get(url, {}).get(login) != "CHANGES_REQUESTED":
-            continue
         repo = item["repository_url"].split("/repos/", 1)[-1]
         response = requests.get(
             f"{api}/repos/{repo}/pulls/{item['number']}", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT
@@ -797,15 +840,19 @@ def fetch_github_prs(panel):
         if response.status_code != 200:
             continue
         detail = response.json()
-        reviewers = [user.get("login") for user in detail.get("requested_reviewers", [])]
         head_sha = (detail.get("head") or {}).get("sha")
+        if head_sha:
+            checks[url] = _github_checks(api, headers, repo, head_sha, ignore)
+        if review_states.get(url, {}).get(login) != "CHANGES_REQUESTED":
+            continue
+        reviewers = [user.get("login") for user in detail.get("requested_reviewers", [])]
         reviewed_sha = review_commits.get(url, {}).get(login)
         if url in requested_urls and login in reviewers:
             rerequested.add(url)
         elif head_sha and reviewed_sha and head_sha != reviewed_sha:
             updated_since.add(url)
     rows, summary = classify_github_prs(
-        login, requested, reviewed, mine, review_states, rerequested, updated_since
+        login, requested, reviewed, mine, review_states, rerequested, updated_since, checks
     )
 
     # SAML orgs silently drop their repos from search results (a plain 200
@@ -820,6 +867,106 @@ def fetch_github_prs(panel):
             f"{len(rows)} PRs visible without them ({login})"
         )
     return PanelResult(True, "links", rows, f"{summary} ({login})")
+
+
+def _github_checks(api, headers, repo, sha, ignore=()):
+    """
+    Every check on a PR head, folded into the board's columns: the check-runs
+    API (GitHub Actions, apps such as SonarQube) plus the legacy combined
+    commit status (CI that still posts statuses). A fine-grained token
+    without ``Checks: Read`` gets a 403 from check-runs - reported as hidden
+    rather than read as green, since a PR with no visible checks is not the
+    same as a PR whose checks passed.
+    """
+    entries, hidden = [], False
+    response = requests.get(
+        f"{api}/repos/{repo}/commits/{sha}/check-runs", params={"per_page": 100}, headers=headers,
+        timeout=DEFAULT_HTTP_TIMEOUT,
+    )
+    if response.status_code == 403:
+        hidden = True
+    elif response.status_code == 200:
+        for run in response.json().get("check_runs", []):
+            entries.append({"name": run.get("name") or "", "bucket": _bucket_check_run(run)})
+    response = requests.get(f"{api}/repos/{repo}/commits/{sha}/status", headers=headers, timeout=DEFAULT_HTTP_TIMEOUT)
+    if response.status_code == 200:
+        for status in response.json().get("statuses", []):
+            entries.append({"name": status.get("context") or "", "bucket": _bucket_commit_status(status)})
+    return summarize_checks(entries, repo, ignore, hidden)
+
+
+def _bucket_check_run(run):
+    if run.get("status") != "completed":
+        return "pending"
+    conclusion = (run.get("conclusion") or "").lower()
+    if conclusion in ("success", "neutral"):
+        return "pass"
+    if conclusion in ("skipped", "cancelled"):
+        return "skip"
+    return "fail"  # failure, timed_out, action_required, startup_failure, stale
+
+
+def _bucket_commit_status(status):
+    state = (status.get("state") or "").lower()
+    if state == "success":
+        return "pass"
+    if state == "pending":
+        return "pending"
+    return "fail"  # failure, error
+
+
+def check_slot(name):
+    """The board column a check name belongs to, or None when it has none."""
+    lowered = name.lower()
+    needles_by_slot = dict(CHECK_SLOTS)
+    for slot in CHECK_MATCH_ORDER:
+        if any(needle in lowered for needle in needles_by_slot[slot]):
+            return slot
+    return None
+
+
+def check_is_ignored(name, repo, rules):
+    """True when an ``ignore_checks`` rule covers this check in this repo."""
+    for rule in rules or ():
+        if rule["name"].lower() in name.lower() and (not rule.get("repo") or rule["repo"].lower() in repo.lower()):
+            return True
+    return False
+
+
+def summarize_checks(entries, repo="", ignore=(), hidden=False):
+    """
+    Fold a PR head's checks (``[{name, bucket}]``, bucket one of pass / fail /
+    pending / skip) into the board's columns. Returns ``{"slots": [(slot,
+    state)...], "red": [names], "ignored": [names], "hidden": bool}`` where
+    each slot's state is the worst of its checks: fail > pending > ignored >
+    pass > none ("none" = this repo runs nothing that matches) - a waved
+    failure outranks a sibling pass so the column never claims green for a
+    gate that actually failed. ``red``
+    names every failed check whatever its slot - that list is exactly what
+    the review workflow skips a PR for - and ``ignored`` the failures an
+    ``ignore_checks`` rule waved through. ``hidden`` (the token cannot see
+    check runs) blanks every slot to "hidden" instead of faking green.
+    """
+    rank = {"none": 0, "pass": 1, "ignored": 2, "pending": 3, "fail": 4}
+    states = {slot: "none" for slot, _ in CHECK_SLOTS}
+    red, ignored = [], []
+    for entry in entries:
+        name, bucket = entry["name"], entry["bucket"]
+        if bucket == "skip":
+            continue
+        if bucket == "fail" and check_is_ignored(name, repo, ignore):
+            ignored.append(name)
+            bucket = "ignored"
+        elif bucket == "fail":
+            red.append(name)
+        slot = check_slot(name)
+        if slot and rank[bucket] > rank[states[slot]]:
+            states[slot] = bucket
+    if hidden:
+        states = {slot: "hidden" for slot in states}
+    return {
+        "slots": [(slot, states[slot]) for slot, _ in CHECK_SLOTS], "red": red, "ignored": ignored, "hidden": hidden,
+    }
 
 
 def _github_login(api, headers):
@@ -891,9 +1038,9 @@ def _pr_review_states(api, headers, item):
 
 
 def classify_github_prs(login, requested, reviewed, mine, review_states, rerequested=frozenset(),
-                        updated_since=frozenset()):
+                        updated_since=frozenset(), checks=None):
     """
-    Turn the three searches into ordered, badged link rows. Returns
+    Turn the three searches into ordered, badged, grouped link rows. Returns
     (rows, summary). ``rerequested`` is the set of PR urls where I appear in
     requested_reviewers DESPITE having a changes-requested review - only an
     explicit re-request by the author puts me back there, so those PRs return
@@ -901,62 +1048,95 @@ def classify_github_prs(login, requested, reviewed, mine, review_states, rereque
     moved past the sha my changes-requested review was submitted against -
     the author pushed something (maybe an unrelated merge, but a second look
     beats never seeing it again), so those also return to "needs my review";
-    an explicit re-request wins when both signals are present. Buckets, in
-    display order:
+    an explicit re-request wins when both signals are present. ``checks``
+    maps PR url to its summarize_checks() result. Groups, in display order:
 
+    others' PRs / ready for review - what the review workflow would actually
+    review:
     - my UNSUBMITTED draft review (state PENDING): flagged loudest - a draft
       is invisible to the author, so until I hit "Submit review" nobody knows
       I responded and everyone is waiting on everyone;
-    - "changes requested" by me, not re-requested (a team-level request
-      matches the search without putting me back personally) and nothing
-      pushed since: waiting on the AUTHOR, not on me;
     - review requested and I have not blocked it - including re-requests
       and new pushes after my changes-requested review, marked so I know
       it's round two;
     - reviewed with only a comment and no pending request: soft state, shown
-      so it isn't forgotten;
-    - my own open PRs, with the aggregate verdict of everyone else's reviews;
-    - DRAFT PRs - anyone's, mine included - greyed at the very bottom:
-      parked on purpose, nothing for anyone to approve yet.
+      so it isn't forgotten.
+    others' PRs / not ready - nothing for me to do yet, and why:
+    - any of the above with a failed check (the review workflow skips red
+      CI: the author has work to do that will change the diff);
+    - "changes requested" by me, not re-requested (a team-level request
+      matches the search without putting me back personally) and nothing
+      pushed since: waiting on the AUTHOR;
+    - someone else's draft.
+    my PRs / open - with the aggregate verdict of everyone else's reviews;
+    my PRs / drafts.
 
     Approved-by-me PRs with no new request are dropped - nothing is waited on.
     """
-    drafts, need, waiting, commented, own, parked = [], [], [], [], [], []
+    checks = checks or {}
+    unsubmitted, ready, red, waiting, their_drafts, own, own_drafts = [], [], [], [], [], [], []
     seen = set()
     for item in requested + reviewed:
-        if item["html_url"] in seen:
+        url = item["html_url"]
+        if url in seen:
             continue
-        seen.add(item["html_url"])
+        seen.add(url)
+        pr_checks = checks.get(url)
         if item.get("draft"):
-            parked.append(_github_row(item, "◌", "dim", "draft · parked, nothing to approve", dim=True))
+            their_drafts.append(
+                _github_row(item, "◌", "dim", "draft", pr_checks, GROUP_OTHERS, SUB_NOT_READY, dim=True)
+            )
             continue
-        my_state = review_states.get(item["html_url"], {}).get(login)
-        is_requested = any(i["html_url"] == item["html_url"] for i in requested)
+        my_state = review_states.get(url, {}).get(login)
+        is_requested = any(i["html_url"] == url for i in requested)
         if my_state == "PENDING":
-            drafts.append(_github_row(item, "✏", "bold red", "UNSUBMITTED draft review - the author can't see it"))
-        elif my_state == "CHANGES_REQUESTED" and item["html_url"] in rerequested:
-            need.append(_github_row(item, "●", "bold cyan", "re-requested after your changes"))
-        elif my_state == "CHANGES_REQUESTED" and item["html_url"] in updated_since:
-            need.append(_github_row(item, "●", "bold cyan", "updated since your changes - re-review?"))
+            bucket, badge, style = unsubmitted, "✏", "bold red"
+            note = "UNSUBMITTED draft review - the author can't see it"
+        elif my_state == "CHANGES_REQUESTED" and url in rerequested:
+            bucket, badge, style, note = ready, "●", "bold cyan", "re-requested after your changes"
+        elif my_state == "CHANGES_REQUESTED" and url in updated_since:
+            bucket, badge, style, note = ready, "●", "bold cyan", "updated since your changes - re-review?"
         elif my_state == "CHANGES_REQUESTED":
-            waiting.append(_github_row(item, "✋", "bold yellow", "you requested changes"))
+            waiting.append(
+                _github_row(item, "✋", "bold yellow", "you requested changes", pr_checks, GROUP_OTHERS, SUB_NOT_READY)
+            )
+            continue
         elif is_requested:
-            need.append(_github_row(item, "●", "bold cyan", None))
+            bucket, badge, style, note = ready, "●", "bold cyan", None
         elif my_state == "COMMENTED":
-            commented.append(_github_row(item, "💬", "dim", "you commented"))
+            bucket, badge, style, note = ready, "💬", "dim", "you commented"
+        else:
+            continue
+        if bucket is ready and pr_checks and pr_checks["red"]:
+            red.append(_github_row(item, badge, style, note, pr_checks, GROUP_OTHERS, SUB_NOT_READY))
+        else:
+            bucket.append(_github_row(item, badge, style, note, pr_checks, GROUP_OTHERS, SUB_READY))
     for item in mine:
+        pr_checks = checks.get(item["html_url"])
         if item.get("draft"):
-            parked.append(_github_row(item, "◌", "dim", "your draft · parked, nothing to approve", dim=True))
+            own_drafts.append(_github_row(item, "◌", "dim", "your draft", pr_checks, GROUP_MINE, SUB_DRAFTS, dim=True))
             continue
         others = {u: s for u, s in review_states.get(item["html_url"], {}).items() if u != login}
-        own.append(_github_row(item, "⬆", "bold magenta", f"your PR · {_own_pr_verdict(others)}"))
-    rows = drafts + need + waiting + commented + own + parked
-    summary = f"{len(need)} to review · {len(waiting)} on author · {len(own)} yours"
-    if drafts:
-        summary = f"{len(drafts)} UNSUBMITTED · {summary}"
-    if parked:
-        summary += f" · {len(parked)} parked"
+        own.append(
+            _github_row(
+                item, "⬆", "bold magenta", f"your PR · {_own_pr_verdict(others)}", pr_checks, GROUP_MINE, SUB_OPEN
+            )
+        )
+    rows = unsubmitted + ready + red + waiting + their_drafts + own + own_drafts
+    summary = pr_summary(
+        len(unsubmitted) + len(ready), len(red) + len(waiting) + len(their_drafts), len(own), len(own_drafts)
+    )
+    if unsubmitted:
+        summary = f"{len(unsubmitted)} UNSUBMITTED · {summary}"
     return rows, summary
+
+
+def pr_summary(ready, not_ready, own, own_drafts):
+    """The panel subtitle: one count per group, drafts only when there are any."""
+    summary = f"{ready} ready · {not_ready} not ready · {own} yours"
+    if own_drafts:
+        summary += f" · {own_drafts} drafts"
+    return summary
 
 
 def _own_pr_verdict(others):
@@ -968,17 +1148,33 @@ def _own_pr_verdict(others):
     return "⧗ awaiting review"
 
 
-def _github_row(item, badge, badge_style, note, dim=False):
+def _github_row(item, badge, badge_style, note, checks=None, group=None, subgroup=None, dim=False):
     repo = item["repository_url"].split("/repos/", 1)[-1]
-    meta = f"by {item['user']['login']} · updated {_age(item['updated_at'])} ago"
+    return _pr_row(
+        badge, badge_style, f"{repo}#{item['number']}  {item['title']}", item["html_url"],
+        item["user"]["login"], item["updated_at"], note, checks, group, subgroup, dim,
+    )
+
+
+def _pr_row(badge, badge_style, text, url, author, updated_at, note, checks, group, subgroup, dim):
+    """
+    One PR link row. ``checks`` is the summarize_checks() result (None when
+    the head's checks were not fetched), rendered by the TUI as the
+    lint/tests/sonar columns ahead of ``meta``; ``group``/``subgroup`` are the
+    headers the row sits under.
+    """
+    meta = f"by {author} · updated {_age(updated_at)} ago"
     if note:
         meta += f" · {note}"
     return {
         "badge": badge,
         "badge_style": badge_style,
-        "text": f"{repo}#{item['number']}  {item['title']}",
-        "url": item["html_url"],
+        "text": text,
+        "url": url,
         "meta": meta,
+        "checks": checks,
+        "group": group,
+        "subgroup": subgroup,
         "dim": dim,
     }
 
@@ -1042,8 +1238,46 @@ def fetch_bitbucket_prs(panel):
         for pr in response.json().get("values", []):
             if _bitbucket_involves(uuid, pr):
                 found.append((repo, pr))
-    rows, summary = classify_bitbucket_prs(uuid, found)
+    ignore = panel.get("ignore_checks") or []
+    checks = {}
+    for repo, pr in found:
+        sha = ((pr.get("source") or {}).get("commit") or {}).get("hash")
+        if sha:
+            checks[pr["links"]["html"]["href"]] = _bitbucket_checks(workspace, repo, sha, auth, ignore)
+    rows, summary = classify_bitbucket_prs(uuid, found, checks)
     return PanelResult(True, "links", rows, f"{summary} ({workspace})")
+
+
+def _bitbucket_checks(workspace, repo, sha, auth, ignore=()):
+    """
+    Every commit status on a PR head (Pipelines, Sonar, anything else that
+    posts a build status), folded into the board's columns. Bitbucket has one
+    status system, so nothing is hidden by token type; a non-200 listing is
+    reported as hidden rather than read as green.
+    """
+    entries = []
+    url = f"{BITBUCKET_API}/repositories/{workspace}/{repo}/commit/{sha}/statuses?pagelen=100"
+    while url:
+        response = requests.get(url, auth=auth, timeout=DEFAULT_HTTP_TIMEOUT)
+        if response.status_code != 200:
+            return summarize_checks([], repo, ignore, hidden=True)
+        payload = response.json()
+        for status in payload.get("values", []):
+            name = status.get("name") or status.get("key") or ""
+            entries.append({"name": name, "bucket": _bucket_bitbucket_status(status)})
+        url = payload.get("next")
+    return summarize_checks(entries, repo, ignore)
+
+
+def _bucket_bitbucket_status(status):
+    state = (status.get("state") or "").upper()
+    if state == "SUCCESSFUL":
+        return "pass"
+    if state == "INPROGRESS":
+        return "pending"
+    if state == "STOPPED":
+        return "skip"
+    return "fail"  # FAILED / ERROR
 
 
 def _bitbucket_involves(uuid, pr):
@@ -1053,33 +1287,47 @@ def _bitbucket_involves(uuid, pr):
     return any(reviewer.get("uuid") == uuid for reviewer in pr.get("reviewers") or [])
 
 
-def classify_bitbucket_prs(uuid, found):
+def classify_bitbucket_prs(uuid, found, checks=None):
     """
-    Turn (repo_slug, pr) pairs into ordered, badged link rows - the Bitbucket
-    counterpart of classify_github_prs, using the same badges so both panels
-    read the same way. Buckets, in display order:
+    Turn (repo_slug, pr) pairs into ordered, badged, grouped link rows - the
+    Bitbucket counterpart of classify_github_prs, using the same badges and
+    groups so both panels read the same way. ``checks`` maps PR url to its
+    summarize_checks() result. Groups, in display order:
 
-    - review requested and I have not voted: needs my review;
-    - I requested changes: waiting on the AUTHOR, not on me;
-    - my own open PRs, with the aggregate verdict of everyone else's votes;
-    - draft PRs - anyone's, mine included - greyed at the bottom.
+    - others' PRs / ready for review: review requested, I have not voted, no
+      failed check;
+    - others' PRs / not ready: a failed check, or I requested changes
+      (waiting on the AUTHOR), or someone else's draft;
+    - my PRs / open, with the aggregate verdict of everyone else's votes;
+    - my PRs / drafts.
 
     PRs I already approved are dropped (nothing is waited on). Bitbucket has
     no "commented" participant state, so there is no equivalent of the GitHub
-    💬 bucket, and no unsubmitted-draft-review state to flag.
+    💬 row, and no unsubmitted-draft-review state to flag.
     """
-    need, waiting, own, parked = [], [], [], []
+    checks = checks or {}
+    ready, red, waiting, their_drafts, own, own_drafts = [], [], [], [], [], []
     for repo, pr in found:
         author_uuid = (pr.get("author") or {}).get("uuid")
         participants = pr.get("participants") or []
         mine = author_uuid == uuid
+        pr_checks = checks.get(pr["links"]["html"]["href"])
         if pr.get("draft"):
-            note = "your draft · parked, nothing to approve" if mine else "draft · parked, nothing to approve"
-            parked.append(_bitbucket_row(repo, pr, "◌", "dim", note, dim=True))
+            if mine:
+                own_drafts.append(
+                    _bitbucket_row(repo, pr, "◌", "dim", "your draft", pr_checks, GROUP_MINE, SUB_DRAFTS, dim=True)
+                )
+            else:
+                their_drafts.append(
+                    _bitbucket_row(repo, pr, "◌", "dim", "draft", pr_checks, GROUP_OTHERS, SUB_NOT_READY, dim=True)
+                )
             continue
         if mine:
             others = [p for p in participants if (p.get("user") or {}).get("uuid") != uuid]
-            own.append(_bitbucket_row(repo, pr, "⬆", "bold magenta", f"your PR · {_bitbucket_verdict(others)}"))
+            own.append(_bitbucket_row(
+                repo, pr, "⬆", "bold magenta", f"your PR · {_bitbucket_verdict(others)}", pr_checks,
+                GROUP_MINE, SUB_OPEN,
+            ))
             continue
         my_state = next(
             (p.get("state") for p in participants if (p.get("user") or {}).get("uuid") == uuid), None
@@ -1087,13 +1335,15 @@ def classify_bitbucket_prs(uuid, found):
         if my_state == "approved":
             continue
         if my_state == "changes_requested":
-            waiting.append(_bitbucket_row(repo, pr, "✋", "bold yellow", "you requested changes"))
+            waiting.append(_bitbucket_row(
+                repo, pr, "✋", "bold yellow", "you requested changes", pr_checks, GROUP_OTHERS, SUB_NOT_READY
+            ))
+        elif pr_checks and pr_checks["red"]:
+            red.append(_bitbucket_row(repo, pr, "●", "bold cyan", None, pr_checks, GROUP_OTHERS, SUB_NOT_READY))
         else:
-            need.append(_bitbucket_row(repo, pr, "●", "bold cyan", None))
-    rows = need + waiting + own + parked
-    summary = f"{len(need)} to review · {len(waiting)} on author · {len(own)} yours"
-    if parked:
-        summary += f" · {len(parked)} parked"
+            ready.append(_bitbucket_row(repo, pr, "●", "bold cyan", None, pr_checks, GROUP_OTHERS, SUB_READY))
+    rows = ready + red + waiting + their_drafts + own + own_drafts
+    summary = pr_summary(len(ready), len(red) + len(waiting) + len(their_drafts), len(own), len(own_drafts))
     return rows, summary
 
 
@@ -1107,18 +1357,11 @@ def _bitbucket_verdict(others):
     return "⧗ awaiting review"
 
 
-def _bitbucket_row(repo, pr, badge, badge_style, note, dim=False):
-    meta = f"by {pr['author']['display_name']} · updated {_age(pr['updated_on'])} ago"
-    if note:
-        meta += f" · {note}"
-    return {
-        "badge": badge,
-        "badge_style": badge_style,
-        "text": f"{repo}#{pr['id']}  {pr['title']}",
-        "url": pr["links"]["html"]["href"],
-        "meta": meta,
-        "dim": dim,
-    }
+def _bitbucket_row(repo, pr, badge, badge_style, note, checks=None, group=None, subgroup=None, dim=False):
+    return _pr_row(
+        badge, badge_style, f"{repo}#{pr['id']}  {pr['title']}", pr["links"]["html"]["href"],
+        pr["author"]["display_name"], pr["updated_on"], note, checks, group, subgroup, dim,
+    )
 
 
 def _bitbucket_workspace_repos(workspace, auth):

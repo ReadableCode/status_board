@@ -331,10 +331,59 @@ badge the rows:
 - `💬` you commented without approving/blocking and no request is pending
 - `⬆` your own open PR, with the aggregate verdict of everyone else's
   reviews (`✓ approved` / `✗ changes requested` / `⧗ awaiting review`)
-- `◌` draft PR — anyone's, yours included: greyed and sorted last, parked
-  until it's marked ready, nothing to approve
+- `◌` draft PR — greyed, nothing to approve until it's marked ready
 
-PRs you approved with nothing further pending are dropped. The account is
+PRs you approved with nothing further pending are dropped.
+
+Rows are grouped so the panel reads top-down as "what is on me":
+
+```
+others' PRs
+  ready for review
+    ● acme/app#412  weekly overview export
+        lint ✓  tests ✓  sonar ✗   by alice · updated 2h ago · red: SonarQube Code Analysis
+  not ready
+    ✋ acme/app#401  debit memo reconciliation dag
+        lint ✗  tests ✓  sonar –   by alice · updated 1d ago · you requested changes · red: ruff
+my PRs
+  open
+    ⬆ acme/app#420  move the credentials loader into the harness
+        lint ✓  tests ✓  sonar ✓   by you · updated 2h ago · your PR · ⧗ awaiting review
+  drafts
+    ◌ acme/app#91  retry on 429 from the billing api
+        lint ✓  tests ✗  sonar –   by you · updated 5h ago · your draft · red: pytest
+```
+
+**others' PRs / ready for review** is exactly the set a review workflow
+would review: not a draft, no failed check. **not ready** holds the rest and
+says why — a failed check, your own changes-requested review the author has
+not answered, or someone else's draft. **my PRs** splits on the draft flag
+only. Empty groups are left out.
+
+Every PR's head commit is checked (check runs plus legacy commit statuses on
+GitHub, commit statuses on Bitbucket) and folded into three fixed columns so
+they line up on every row whatever a repo runs: **lint** (ruff, isort,
+black, flake8, pre-commit, mypy, eslint, prettier, anything with "lint" in
+the name), **tests** (pytest, test, unit, integration) and **sonar**
+(SonarQube, quality gate). Each column shows the worst of its checks: `✗`
+failed, `⧗` still running (running is not red — the PR stays ready), `✓`
+passed, `–` the repo runs nothing that matches, `?` the token cannot see
+check runs. A failed check with no column (a docker build, a deploy) still
+turns the PR red and is named in the row's `red:` list, so the board agrees
+with the review workflow on what "skip, red CI" means.
+
+A repo whose quality gate fails on every PR and is merged red anyway can be
+waved through with `ignore_checks` on the panel: a failed check whose name
+contains `name` (case-insensitive) in a repo whose name contains `repo`
+(every repo when omitted) shows as `ignored` instead of `✗` and does not
+make the PR not ready. Keep this list in the credentials repo's config,
+next to the panel it belongs to:
+
+```yaml
+  ignore_checks:
+    - repo: some-repo
+      name: SonarQube
+``` The account is
 whoever the token belongs to, so two accounts = two panels with different
 `token_env` names. Two panels can also share ONE account with different
 fine-grained tokens: the search only returns repos a token was granted, so a
@@ -374,7 +423,13 @@ rendering an empty queue.
 Auth is a Bitbucket app password (Account settings → App passwords, scopes:
 Account read + Pull requests read). Bitbucket has no cross-workspace
 "review requested" search, so the board queries per repo — list the repos you
-care about to keep it fast.
+care about to keep it fast. Rows use the same badges, groups and check
+columns as `github_prs` (Bitbucket has no "commented" state and no
+unsubmitted-draft-review state, so `💬` and `✏` never appear); checks come
+from the head commit's build statuses, so a Pipelines run that posts one
+status for the whole pipeline shows up by name in the `red:` list rather than
+in a column. `ignore_checks` works the same way, matching `repo` against the
+repo slug.
 
 ## Viewing from a personal device
 
